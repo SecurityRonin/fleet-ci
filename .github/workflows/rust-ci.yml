@@ -271,12 +271,24 @@ jobs:
           curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${v}/gitleaks_${v}_linux_x64.tar.gz" \
             | tar xz -C /tmp gitleaks
           /tmp/gitleaks version
-      - name: Scan history
-        run: /tmp/gitleaks git --redact --exit-code 1 .
-      - name: Scan working tree
-        # `git` mode walks commit patches; `dir` mode catches an unstaged or
-        # gitignored file that never became a commit.
-        run: /tmp/gitleaks dir --redact --exit-code 1 .
+      - name: Scan
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 60 fleet repos ship a .gitleaks.toml allowlisting forensic fixtures
+          # that look like credentials (key material in a test image is the
+          # artifact under test, not a leak). Ignoring it would bury the job in
+          # false positives, and a scanner nobody trusts is a scanner nobody reads.
+          cfg=()
+          if [ -f .gitleaks.toml ]; then
+            cfg=(--config .gitleaks.toml)
+            echo "Using repo-local .gitleaks.toml"
+          fi
+          # `git` mode walks commit patches; `dir` mode catches an unstaged or
+          # gitignored file that never became a commit. Both, because either
+          # alone leaves a real hole.
+          /tmp/gitleaks git  --redact --no-banner --exit-code 1 "${cfg[@]}" .
+          /tmp/gitleaks dir  --redact --no-banner --exit-code 1 "${cfg[@]}" .
       # KNOWN GAP, stated rather than papered over: gitleaks scans patch content
       # and files. It does NOT read commit messages or tag annotations, so a
       # credential pasted into a commit message is invisible to this job. That
