@@ -293,15 +293,28 @@ jobs:
       RUSTFLAGS: ""
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Detect fuzz targets
+      - name: Detect fuzz crates
         id: detect
         shell: bash
         run: |
-          if [ -d fuzz ]; then
-            echo "present=true" >> "$GITHUB_OUTPUT"
-          else
+          set -euo pipefail
+          # A fuzz crate is NOT always at the repo root: fleet-wide it sits at
+          # `fuzz/` (70 repos) but also `core/fuzz`, `forensic/fuzz`, and
+          # `crates/<member>/fuzz` (11 repos). Checking only `-d fuzz` would skip
+          # those silently — a fuzz job that passes by finding nothing is worse
+          # than no fuzz job, because it reads as coverage that does not exist.
+          # cargo-fuzz runs from the crate that OWNS the fuzz dir, i.e. its parent.
+          find . -type d -name fuzz -not -path '*/target/*' -not -path '*/.*/*' \
+            -exec test -f '{}/Cargo.toml' \; -print \
+            | sed 's![/]fuzz$!!' | sed 's!^$!.!' | sort -u > /tmp/fuzz_dirs.txt
+          n=$(wc -l < /tmp/fuzz_dirs.txt | tr -d ' ')
+          echo "count=$n" >> "$GITHUB_OUTPUT"
+          if [ "$n" -eq 0 ]; then
             echo "present=false" >> "$GITHUB_OUTPUT"
-            echo "No fuzz/ directory — skipping."
+            echo "No fuzz crate in this repo — skipping."
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+            echo "Found $n fuzz crate(s):"; cat /tmp/fuzz_dirs.txt
           fi
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         if: steps.detect.outputs.present == 'true'
@@ -315,9 +328,16 @@ jobs:
         run: cargo install cargo-fuzz
       - name: Build fuzz targets
         if: steps.detect.outputs.present == 'true'
+        shell: bash
         # `+nightly` on the command line beats rust-toolchain.toml's stable pin;
         # without it the pin wins and `-Z sanitizer=address` is rejected.
-        run: cargo +nightly fuzz build
+        run: |
+          set -euo pipefail
+          while read -r dir; do
+            echo "::group::cargo fuzz build in ${dir}"
+            (cd "$dir" && cargo +nightly fuzz build)
+            echo "::endgroup::"
+          done < /tmp/fuzz_dirs.txt
 
   coverage:
     name: >-

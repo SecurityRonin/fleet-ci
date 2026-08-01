@@ -176,11 +176,19 @@ guessing a floor it would then claim to have verified.
 
 ### Fuzz is detected, not configured
 
-The `fuzz-build` job checks for a `fuzz/` directory at runtime and skips when
-there is none — so nothing needs per-repo wiring, and a repo that gains fuzz
-targets is covered the moment they land. It is a **build check**, not a
-campaign; the long run stays in each repo's `fuzz.yml` (68 repos already have
-one).
+The `fuzz-build` job discovers fuzz crates at runtime and skips when there are
+none — so nothing needs per-repo wiring, and a repo that gains fuzz targets is
+covered the moment they land. It is a **build check**, not a campaign; the long
+run stays in each repo's `fuzz.yml` (68 repos already have one).
+
+Detection looks for *any* directory named `fuzz` containing a `Cargo.toml`, not
+just one at the repo root, and runs `cargo fuzz build` from each owning parent.
+That distinction is load-bearing: 79 fleet repos have a fuzz crate, but only 70
+keep it at `fuzz/` — the other 9 use `core/fuzz`, `forensic/fuzz`, or
+`crates/<member>/fuzz`. A root-only check would have skipped those **silently**,
+and a fuzz job that passes because it found nothing is worse than no fuzz job at
+all: it reads as coverage that does not exist. The discovery logic was run
+against all 92 repos and matches ground truth exactly.
 
 ## Secrets
 
