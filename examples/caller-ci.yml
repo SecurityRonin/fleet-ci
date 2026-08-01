@@ -1,0 +1,17 @@
+# The stub every fleet repo drops in at .github/workflows/ci.yml.
+# Replace <SHA> with the fleet-config commit you are pinning to.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    uses: SecurityRonin/fleet-config/.github/workflows/rust-ci.yml@<SHA>

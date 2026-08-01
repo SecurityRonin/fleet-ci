@@ -1,0 +1,474 @@
+# SecurityRonin fleet — reusable Rust CI.
+#
+# One workflow, called by every fleet repo. Replaces 89 hand-maintained
+# variants. See README.md for the caller stub and the input reference.
+#
+# Every third-party action is pinned to a full commit SHA whose tag was
+# verified against the GitHub API (`gh api repos/<o>/<r>/commits/<tag>`),
+# not copied from another workflow. Bump them here, once, fleet-wide.
+
+name: Rust CI (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      msrv:
+        description: >
+          MSRV to verify. Leave empty (the default) to derive it from the
+          workspace's own `rust-version` — the declared promise is then
+          structurally incapable of disagreeing with the job that verifies it.
+          Set explicitly only to test a floor *below* what Cargo.toml declares.
+        type: string
+        default: ""
+      msrv-check:
+        description: >
+          What the MSRV job runs: `build` (compiles on the floor) or `test`
+          (also runs the suite there). `test` is stricter; `build` is right
+          when dev-dependencies outrun the library's own floor.
+        type: string
+        default: build
+      os-matrix:
+        description: Run the test job on ubuntu + macos + windows.
+        type: boolean
+        default: true
+      all-features:
+        description: >
+          Append `--all-features` to clippy/test/coverage. Default true per
+          the batteries-included policy. Turn off only for a crate with
+          genuinely mutually-exclusive features.
+        type: boolean
+        default: true
+      coverage-gate:
+        description: >
+          `strict`  — every executable line covered, except lines annotated
+                      `// cov:unreachable: <invariant>`. This is the fleet
+                      standard.
+          `floor`   — aggregate line percentage >= `coverage-floor`. MIGRATION
+                      STATE ONLY: an aggregate cannot honour a per-line
+                      exemption, so a repo on `floor` is not meeting the
+                      standard. The job name says so in the checks UI.
+          `off`     — no coverage job.
+        type: string
+        default: strict
+      coverage-floor:
+        description: "Percentage floor for `coverage-gate: floor`. Ignored otherwise."
+        type: number
+        default: 100
+      coverage-scope:
+        description: >
+          `workspace` — all members, all test targets (unit + integration).
+          `lib`       — `--workspace --lib`, unit tests only. Under-counts any
+                        repo whose oracle/differential suites live in tests/.
+        type: string
+        default: workspace
+      coverage-ignore-regex:
+        description: Passed to `--ignore-filename-regex` when non-empty.
+        type: string
+        default: ""
+      require-exemption-reason:
+        description: >
+          Reject a bare `// cov:unreachable` with no `: <invariant>` after it.
+          The marker asserts a guard is provably dead; an assertion with no
+          stated invariant cannot be reviewed. Default true.
+        type: boolean
+        default: true
+      deny-config-repo:
+        description: >
+          Repo holding the shared deny.toml (cargo-deny has no include/extends
+          mechanism — v0.19.0 offers only `-c/--config` — so the shared config
+          is fetched and passed by path). Set to "" to use the repo's own
+          local deny.toml instead.
+        type: string
+        default: SecurityRonin/fleet-config
+      deny-config-ref:
+        description: Ref of `deny-config-repo` to check out. Pin to a SHA in production.
+        type: string
+        default: main
+      deny-config-path:
+        description: Path to deny.toml within `deny-config-repo`.
+        type: string
+        default: deny.toml
+      vet:
+        description: Run `cargo vet` (supply-chain, unreviewed-code gate).
+        type: boolean
+        default: true
+      secret-scan:
+        description: Run the gitleaks secret scan. Should never be false.
+        type: boolean
+        default: true
+      gitleaks-version:
+        description: Pinned gitleaks release.
+        type: string
+        # renovate: datasource=github-releases depName=gitleaks/gitleaks
+        default: "8.30.1"
+      fuzz-build-check:
+        description: >
+          Build the fuzz targets when a `fuzz/` directory exists (a compile
+          check, not a campaign — the long run belongs in fuzz.yml). Auto-skips
+          when there is no fuzz/ directory, so this needs no per-repo wiring.
+        type: boolean
+        default: true
+
+# The GITHUB_TOKEN gets read-only repository access and nothing else. A called
+# workflow can never hold more than its caller grants, so the caller declares
+# the same block; this one is the floor, not a request.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUSTFLAGS: -Dwarnings
+  # Caller-level `env:` is NOT inherited by a called workflow, so everything
+  # the jobs below rely on has to be declared right here.
+
+jobs:
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - run: cargo clippy --workspace --all-targets ${{ inputs.all-features && '--all-features' || '' }} -- -D warnings
+
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ inputs.os-matrix && fromJSON('["ubuntu-latest","macos-latest","windows-latest"]') || fromJSON('["ubuntu-latest"]') }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - run: cargo test --workspace ${{ inputs.all-features && '--all-features' || '' }}
+
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+      # Derive the floor from the workspace itself unless the caller overrode
+      # it. Restating the MSRV in CI is how a repo ends up verifying 1.85 while
+      # promising 1.81 to downstreams; reading it makes that impossible.
+      - name: Resolve MSRV
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+          override='${{ inputs.msrv }}'
+          if [ -n "$override" ]; then
+            echo "msrv=$override" >> "$GITHUB_OUTPUT"
+            echo "MSRV (caller override): $override"
+            exit 0
+          fi
+          # Lowest rust-version across workspace members is the floor the whole
+          # workspace can actually be built at. Sorted numerically per component,
+          # so 1.9 does not rank above 1.85 the way a string sort would.
+          msrv="$(cargo metadata --no-deps --format-version 1 | jq -r '
+            [.packages[].rust_version | select(. != null)]
+            | sort_by(split(".") | map(tonumber))
+            | first // ""')"
+          if [ -z "$msrv" ]; then
+            echo "::error::no workspace member declares rust-version. Add one to Cargo.toml, or set the reusable workflow's msrv input explicitly — this job refuses to guess a floor it would then claim to have verified."
+            exit 1
+          fi
+          echo "msrv=$msrv" >> "$GITHUB_OUTPUT"
+          echo "MSRV (derived from rust-version): $msrv"
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: ${{ steps.resolve.outputs.msrv }}
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      # An explicit `+<version>` beats rust-toolchain.toml's pin (which is the
+      # dev toolchain, not the floor). Without it the pin silently wins and the
+      # job verifies nothing.
+      - run: cargo +${{ steps.resolve.outputs.msrv }} ${{ inputs.msrv-check }} --workspace ${{ inputs.all-features && '--all-features' || '' }}
+
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Fetch shared deny.toml
+        if: inputs.deny-config-repo != ''
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.deny-config-repo }}
+          ref: ${{ inputs.deny-config-ref }}
+          path: .fleet-config
+      - uses: taiki-e/install-action@1beb33eee6d086258184383af9a538940be190ed # v2.85.6
+        with:
+          tool: cargo-deny
+      - name: Check advisories, bans, licenses, sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n '${{ inputs.deny-config-repo }}' ]; then
+            cfg=".fleet-config/${{ inputs.deny-config-path }}"
+            if [ ! -f "$cfg" ]; then
+              echo "::error::shared deny config not found at ${{ inputs.deny-config-repo }}@${{ inputs.deny-config-ref }}:${{ inputs.deny-config-path }} (resolved to $cfg)"
+              exit 1
+            fi
+            echo "Using shared config: $cfg"
+            cargo deny --config "$cfg" check all
+          else
+            echo "Using repo-local deny.toml"
+            cargo deny check all
+          fi
+
+  vet:
+    name: cargo-vet
+    if: inputs.vet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+      - uses: taiki-e/install-action@1beb33eee6d086258184383af9a538940be190ed # v2.85.6
+        with:
+          tool: cargo-vet
+      - run: cargo fetch
+      - run: cargo vet --locked
+
+  secret-scan:
+    name: Secret Scan (gitleaks)
+    if: inputs.secret-scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # gitleaks needs full history, not the default shallow clone
+      - name: Install gitleaks
+        shell: bash
+        run: |
+          set -euo pipefail
+          v='${{ inputs.gitleaks-version }}'
+          # Pinned version, never a `latest` API call: the unauthenticated
+          # GitHub API is rate-limited on shared runners, which yields an empty
+          # version and a 404 download that some shells swallow.
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${v}/gitleaks_${v}_linux_x64.tar.gz" \
+            | tar xz -C /tmp gitleaks
+          /tmp/gitleaks version
+      - name: Scan history
+        run: /tmp/gitleaks git --redact --exit-code 1 .
+      - name: Scan working tree
+        # `git` mode walks commit patches; `dir` mode catches an unstaged or
+        # gitignored file that never became a commit.
+        run: /tmp/gitleaks dir --redact --exit-code 1 .
+      # KNOWN GAP, stated rather than papered over: gitleaks scans patch content
+      # and files. It does NOT read commit messages or tag annotations, so a
+      # credential pasted into a commit message is invisible to this job. That
+      # is what `git log --all --grep=<marker> -F` is for, and why commit
+      # messages go through `git commit -F <file>`.
+
+  fuzz-build:
+    name: Fuzz (build check)
+    if: inputs.fuzz-build-check
+    runs-on: ubuntu-latest
+    # -Dwarnings must not leak into cargo-fuzz's own build or the nightly fuzz
+    # build; nightly warns more freely and lint enforcement is clippy's job.
+    env:
+      RUSTFLAGS: ""
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Detect fuzz targets
+        id: detect
+        shell: bash
+        run: |
+          if [ -d fuzz ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "No fuzz/ directory — skipping."
+          fi
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        if: steps.detect.outputs.present == 'true'
+        with:
+          toolchain: nightly
+          components: rust-src
+      - name: Install cargo-fuzz
+        if: steps.detect.outputs.present == 'true'
+        # Deliberately not --locked: cargo-fuzz's pinned Cargo.lock holds an old
+        # rustix whose rustc_* attributes current nightly rejects.
+        run: cargo install cargo-fuzz
+      - name: Build fuzz targets
+        if: steps.detect.outputs.present == 'true'
+        # `+nightly` on the command line beats rust-toolchain.toml's stable pin;
+        # without it the pin wins and `-Z sanitizer=address` is rejected.
+        run: cargo +nightly fuzz build
+
+  coverage:
+    name: >-
+      ${{ inputs.coverage-gate == 'floor'
+          && format('Coverage (FLOOR {0}% — migration debt, not the fleet gate)', inputs.coverage-floor)
+          || 'Coverage (100% lines)' }}
+    if: inputs.coverage-gate != 'off'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: taiki-e/install-action@1beb33eee6d086258184383af9a538940be190ed # v2.85.6
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Assemble coverage flags
+        id: flags
+        shell: bash
+        run: |
+          set -euo pipefail
+          f="--workspace"
+          [ '${{ inputs.coverage-scope }}' = 'lib' ] && f="$f --lib"
+          [ '${{ inputs.all-features }}' = 'true' ] && f="$f --all-features"
+          ignore='${{ inputs.coverage-ignore-regex }}'
+          [ -n "$ignore" ] && f="$f --ignore-filename-regex $ignore"
+          echo "flags=$f" >> "$GITHUB_OUTPUT"
+          echo "cargo llvm-cov $f"
+
+      # -- MIGRATION PATH ------------------------------------------------------
+      - name: Aggregate line floor
+        if: inputs.coverage-gate == 'floor'
+        shell: bash
+        run: |
+          echo "::warning::This repo is on the aggregate coverage FLOOR (${{ inputs.coverage-floor }}%), not the fleet per-line gate. An aggregate percentage cannot honour a '// cov:unreachable' exemption, so it neither identifies which lines are uncovered nor lets a provably-dead guard be annotated instead of deleted. Migrate to coverage-gate: strict."
+          cargo llvm-cov ${{ steps.flags.outputs.flags }} --summary-only --fail-under-lines ${{ inputs.coverage-floor }}
+      - name: Show missing lines (advisory)
+        if: inputs.coverage-gate == 'floor'
+        continue-on-error: true
+        run: cargo llvm-cov ${{ steps.flags.outputs.flags }} --summary-only --show-missing-lines
+
+      # -- THE FLEET GATE ------------------------------------------------------
+      - name: Generate lcov
+        if: inputs.coverage-gate == 'strict'
+        run: cargo llvm-cov ${{ steps.flags.outputs.flags }} --lcov --output-path lcov.info
+
+      - name: Enforce per-line coverage
+        if: inputs.coverage-gate == 'strict'
+        shell: bash
+        env:
+          REQUIRE_REASON: ${{ inputs.require-exemption-reason }}
+        run: |
+          python3 - lcov.info <<'PYGATE'
+          import os, re, sys
+
+          # Fail the build unless every executable line is covered. Two exemptions,
+          # both narrow, both reported by file:line so the gate stays auditable:
+          #
+          #  1. `// cov:unreachable: <invariant>` — a guard that is provably dead
+          #     under a stated dominating invariant. Defence in depth beats coverage
+          #     purism: the guard is desirable and must not be deleted to satisfy a
+          #     number. The invariant is required, because an unreviewable assertion
+          #     is not evidence.
+          #
+          #  2. Delimiter-only lines (`}`, `)`, `);`, `)?;`, `,`) — llvm-cov emits a
+          #     zero-count record on some of these as a region-attribution artifact.
+          #     A line carrying nothing but a delimiter has no behaviour of its own,
+          #     so this hides no untested logic.
+          #
+          # Anything else with a zero hit count is an uncovered line and fails.
+
+          lcov_path = sys.argv[1]
+          require_reason = os.environ.get("REQUIRE_REASON") == "true"
+
+          DELIM_ONLY = re.compile(r"^[}\)\];,?]*$")
+          # Matched as a bare substring, not anchored to `//`. The fleet writes the
+          # marker in a line comment, a trailing block comment (`/* ... */`), and a
+          # doc comment; anchoring to one syntax silently drops the others back into
+          # the failure set. The 36 existing shell gates already match this way.
+          MARKER = re.compile(r"cov:unreachable(?P<reason>\s*:\s*\S.*)?")
+
+          src_cache = {}
+
+          def source_line(path, n):
+              if path not in src_cache:
+                  try:
+                      with open(path, encoding="utf-8", errors="replace") as fh:
+                          src_cache[path] = fh.read().splitlines()
+                  except OSError as exc:
+                      src_cache[path] = exc
+              lines = src_cache[path]
+              if isinstance(lines, OSError):
+                  return None
+              return lines[n - 1] if 0 < n <= len(lines) else None
+
+          uncovered, exempt_annotated, exempt_delim, bare_markers, unreadable = [], [], [], [], []
+          current = None
+
+          with open(lcov_path, encoding="utf-8", errors="replace") as fh:
+              for raw in fh:
+                  raw = raw.rstrip("\n")
+                  if raw.startswith("SF:"):
+                      current = raw[3:]
+                      continue
+                  m = re.match(r"^DA:(\d+),0$", raw)
+                  if not m or current is None:
+                      continue
+                  n = int(m.group(1))
+                  src = source_line(current, n)
+                  if src is None:
+                      # Fail loud: a zero-hit line we cannot read is not a pass.
+                      unreadable.append((current, n))
+                      continue
+                  marker = MARKER.search(src)
+                  if marker:
+                      if marker.group("reason"):
+                          exempt_annotated.append((current, n, src.strip()))
+                      elif require_reason:
+                          bare_markers.append((current, n, src.strip()))
+                      else:
+                          exempt_annotated.append((current, n, src.strip()))
+                  elif DELIM_ONLY.match(src.strip()):
+                      exempt_delim.append((current, n, src.strip()))
+                  else:
+                      uncovered.append((current, n, src.strip()))
+
+          for path, n, src in uncovered:
+              print(f"::error file={path},line={n}::uncovered line: {src}")
+          for path, n, src in bare_markers:
+              print(f"::error file={path},line={n}::bare '// cov:unreachable' with no invariant. "
+                    f"Write '// cov:unreachable: <why this is provably dead>' — the marker asserts "
+                    f"a guard cannot be reached, and an assertion with no stated reason cannot be reviewed.")
+          for path, n in unreadable:
+              print(f"::error::lcov reports {path}:{n} uncovered but the source file could not be read; "
+                    f"refusing to treat an unverifiable line as covered.")
+
+          print(f"\nuncovered: {len(uncovered)}  "
+                f"bare markers: {len(bare_markers)}  "
+                f"unreadable: {len(unreadable)}")
+          print(f"exempt (// cov:unreachable): {len(exempt_annotated)}  "
+                f"exempt (delimiter artifact): {len(exempt_delim)}")
+
+          if exempt_annotated:
+              print("\nAnnotated exemptions (each asserts a dominating invariant):")
+              for path, n, src in exempt_annotated:
+                  print(f"  {path}:{n}: {src}")
+
+          if uncovered or bare_markers or unreadable:
+              sys.exit(1)
+          print("\nEvery executable line is covered, or carries a justified // cov:unreachable.")
+          PYGATE

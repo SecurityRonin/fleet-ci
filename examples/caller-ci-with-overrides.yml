@@ -1,0 +1,24 @@
+# Caller stub for a repo that needs to override a default.
+# Only list what genuinely differs — every `with:` line is drift you are
+# re-introducing, so each one should have a reason a reviewer can check.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    uses: SecurityRonin/fleet-config/.github/workflows/rust-ci.yml@<SHA>
+    with:
+      # MIGRATION DEBT: this repo is not yet at per-line coverage. The floor is
+      # the currently-achieved level, held as a regression backstop. Delete both
+      # lines once the uncovered paths are tested or annotated.
+      coverage-gate: floor
+      coverage-floor: 85
