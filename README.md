@@ -27,10 +27,19 @@ secret scan · fuzz build-check · per-line coverage gate.
 
 | Gap | Before | After |
 |---|---|---|
-| Secret scan | 48 of 91 repos had none | every repo, always on |
-| SHA-pinned actions | 10 of 91 fully pinned; 81 carried a floating tag | every action pinned, tag verified via the GitHub API |
-| `permissions:` block | **0 of 91** declared one | `contents: read`, workflow-wide |
+| Secret scan | 48 of 92 repos had none | every repo, always on |
+| SHA-pinned actions | 10 of 92 fully pinned; the rest carried a floating tag | every action pinned, tag verified via the GitHub API |
+| `permissions:` block | 22 of 92 declared one — **70 did not** | `contents: read`, workflow-wide |
 | Coverage gate | 6 implementations, 3 incompatible semantics | one implementation |
+
+> An earlier draft of this table said **0 of 91** repos declared `permissions:`.
+> That was wrong. The scan regex was `^\s*permissions:` **without
+> `re.MULTILINE`**, so `^` anchored to the start of the file and matched nothing.
+> The real figure is 22 (all top-level; none job-level), confirmed by
+> `grep -rl --include=ci.yml '^permissions:'` — 23 files, one of which is a
+> packaged copy under `codec/xpress-huffman/target/package/`. Every other number
+> here was cross-checked by a second method; this one was not, and it was the one
+> that was wrong.
 
 ### The pins are sound; one provenance label is fiction
 
@@ -139,10 +148,49 @@ module.
 ## `cargo deny` runs from a shared config
 
 `cargo-deny` has **no include/extends mechanism** — v0.19.0's `check` subcommand
-offers only `-c/--config` (verified against `cargo deny check --help`). So the
-shared config is fetched and passed by path: the `deny` job checks out
-`deny-config-repo` into `.fleet-config/` and runs
-`cargo deny --config .fleet-config/<deny-config-path> check all`.
+offers only `-c/--config`. So the shared config is fetched and passed by path:
+the `deny` job checks out `deny-config-repo` into `.fleet-config/` and runs
+`cargo deny check --config .fleet-config/<deny-config-path> all`.
+
+### Argument order is load-bearing
+
+`--config` belongs to the **`check` subcommand**, not to `cargo deny`. Both forms
+were run against cargo-deny 0.19.0:
+
+```
+$ cargo deny --config deny.toml check all
+error: unexpected argument '--config' found
+  tip: 'check --config' exists
+
+$ cargo deny check --config deny.toml all
+advisories ok, bans ok, licenses ok, sources ok
+```
+
+`--all-features`, `--exclude`, and `--target` are the opposite — **global**
+options that must precede `check`. That is what the `deny-args` input is for.
+
+### What the shared config cannot carry
+
+Three settings are genuinely per-repo, and each has a global CLI equivalent, so
+`deny-args` covers them without a second config file:
+
+| Need | Repos | `deny-args` value |
+|---|---|---|
+| Optional features in the graph | 4 | `--all-features` |
+| Drop `*-fuzz` workspace members | 10 | `--exclude <crate>` |
+| Target-specific deps | winevt-forensic only | `--target <triple>` |
+
+**`all-features` must not go in the shared config.** At fleet scope it pulls
+optional GPL-2.0/GPL-3.0 crates (`lzo1x`, `noalloc`) into the graph that are
+correctly out of scope under default features. It belongs to the four repos that
+need it, as a caller-side flag.
+
+`--target` explicitly "overrides the top-level `targets = []` configuration
+value" per `cargo deny --help`, so winevt-forensic needs no bespoke file either.
+
+If the shared config is configured but missing at the given path, the job
+**fails loudly** rather than falling back to the repo-local file — a pass
+reported against a config nobody chose is worse than a failure.
 
 **Assumption:** the shared `deny.toml` lands at
 `SecurityRonin/fleet-config` on `main` at path `deny.toml`. Change the
@@ -251,6 +299,25 @@ and leaves room for `release.yml` / `docs.yml` callees later.
   the gate's Python compiles) and its coverage gate is validated dynamically
   against real `cargo llvm-cov` output — but no CI run has exercised the
   workflow end to end, because the callee repo does not exist yet.
-- The `actions/checkout` pin is **v7.0.1**, three majors ahead of the v4.2.2 the
-  fleet runs today. Centralising makes it one bump instead of 91, but the jump
-  is untested here.
+
+### Action versions are deliberately behaviour-neutral
+
+Every action is pinned to **exactly what the fleet runs today**, so adopting the
+shared workflow changes one variable — where CI is defined — and not two:
+
+| Action | Pin | Version |
+|---|---|---|
+| `actions/checkout` | `11bd71901bbe5b1630ceea73d27597364c9af683` | v4.2.2 |
+| `Swatinem/rust-cache` | `9d47c6ad4b02e050fd481d890b2ea34778fd09d6` | v2.7.8 |
+| `taiki-e/install-action` | `59012be0884e296ca2da49b530610e72c49039ad` | v2.81.6 |
+| `dtolnay/rust-toolchain` | `2c7215f132e9ebf062739d9130488b56d53c060c` | master |
+
+An earlier draft pinned `actions/checkout` at v7.0.1 (three majors ahead) and
+`rust-cache` at v2.9.1. Both were reverted: a version bump hidden inside a
+91-repo consolidation is unreviewable, and when CI breaks nobody can tell whether
+the cause was the migration or the upgrade. The `rust-cache` pin is now the
+**genuine v2.7.8** — the version 56 repos already believe they run — so this
+change fixes the provenance label without altering behaviour.
+
+Upgrades become a separate, reviewable PR against this one file, which is the
+whole point of centralising. Renovate carries them forward from here.

@@ -88,6 +88,18 @@ on:
         description: Path to deny.toml within `deny-config-repo`.
         type: string
         default: deny.toml
+      deny-args:
+        description: >
+          Extra cargo-deny GLOBAL arguments, inserted before the `check`
+          subcommand. This is how a repo carries a setting the shared config
+          cannot: `--all-features` (do NOT put this in the shared file — at
+          fleet scope it pulls optional GPL-2.0/GPL-3.0 crates such as lzo1x
+          and noalloc into the graph that are correctly out of scope under
+          default features), `--exclude <crate>` for fuzz members, and
+          `--target <triple>`, which overrides the config's top-level
+          `targets = []`. Keep it empty unless the repo genuinely needs one.
+        type: string
+        default: ""
       vet:
         description: Run `cargo vet` (supply-chain, unreviewed-code gate).
         type: boolean
@@ -127,7 +139,7 @@ jobs:
     name: Format
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
           toolchain: stable
@@ -138,12 +150,12 @@ jobs:
     name: Clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
           toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
       - run: cargo clippy --workspace --all-targets ${{ inputs.all-features && '--all-features' || '' }} -- -D warnings
 
   test:
@@ -154,18 +166,18 @@ jobs:
       matrix:
         os: ${{ inputs.os-matrix && fromJSON('["ubuntu-latest","macos-latest","windows-latest"]') || fromJSON('["ubuntu-latest"]') }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
       - run: cargo test --workspace ${{ inputs.all-features && '--all-features' || '' }}
 
   msrv:
     name: MSRV
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
           toolchain: stable
@@ -199,7 +211,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
           toolchain: ${{ steps.resolve.outputs.msrv }}
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
       # An explicit `+<version>` beats rust-toolchain.toml's pin (which is the
       # dev toolchain, not the floor). Without it the pin silently wins and the
       # job verifies nothing.
@@ -209,7 +221,7 @@ jobs:
     name: cargo-deny
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Fetch shared deny.toml
         if: inputs.deny-config-repo != ''
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -217,24 +229,37 @@ jobs:
           repository: ${{ inputs.deny-config-repo }}
           ref: ${{ inputs.deny-config-ref }}
           path: .fleet-config
-      - uses: taiki-e/install-action@1beb33eee6d086258184383af9a538940be190ed # v2.85.6
+      - uses: taiki-e/install-action@59012be0884e296ca2da49b530610e72c49039ad # v2.81.6
         with:
           tool: cargo-deny
       - name: Check advisories, bans, licenses, sources
         shell: bash
+        env:
+          DENY_ARGS: ${{ inputs.deny-args }}
         run: |
           set -euo pipefail
+          # Argument order is load-bearing and cargo-deny will not forgive it:
+          #   --config belongs to the `check` SUBCOMMAND, not to `cargo deny`.
+          #   `cargo deny --config X check all` fails with
+          #     "error: unexpected argument '--config' found
+          #      tip: 'check --config' exists"
+          # while `--all-features` / `--exclude` / `--target` are the opposite:
+          # GLOBAL options that must precede `check`. Verified against
+          # cargo-deny 0.19.0 by running both forms.
+          read -r -a globals <<< "${DENY_ARGS}"
           if [ -n '${{ inputs.deny-config-repo }}' ]; then
             cfg=".fleet-config/${{ inputs.deny-config-path }}"
             if [ ! -f "$cfg" ]; then
-              echo "::error::shared deny config not found at ${{ inputs.deny-config-repo }}@${{ inputs.deny-config-ref }}:${{ inputs.deny-config-path }} (resolved to $cfg)"
+              echo "::error::shared deny config not found at ${{ inputs.deny-config-repo }}@${{ inputs.deny-config-ref }}:${{ inputs.deny-config-path }} (resolved to $cfg). Refusing to silently fall back to a repo-local config -- that would report a pass against a config nobody chose."
               exit 1
             fi
             echo "Using shared config: $cfg"
-            cargo deny --config "$cfg" check all
+            set -x
+            cargo deny "${globals[@]}" check --config "$cfg" all
           else
             echo "Using repo-local deny.toml"
-            cargo deny check all
+            set -x
+            cargo deny "${globals[@]}" check all
           fi
 
   vet:
@@ -242,11 +267,11 @@ jobs:
     if: inputs.vet
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
           toolchain: stable
-      - uses: taiki-e/install-action@1beb33eee6d086258184383af9a538940be190ed # v2.85.6
+      - uses: taiki-e/install-action@59012be0884e296ca2da49b530610e72c49039ad # v2.81.6
         with:
           tool: cargo-vet
       - run: cargo fetch
@@ -257,7 +282,7 @@ jobs:
     if: inputs.secret-scan
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0 # gitleaks needs full history, not the default shallow clone
       - name: Install gitleaks
@@ -304,7 +329,7 @@ jobs:
     env:
       RUSTFLAGS: ""
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Detect fuzz crates
         id: detect
         shell: bash
@@ -359,13 +384,13 @@ jobs:
     if: inputs.coverage-gate != 'off'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
           toolchain: stable
           components: llvm-tools-preview
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-      - uses: taiki-e/install-action@1beb33eee6d086258184383af9a538940be190ed # v2.85.6
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+      - uses: taiki-e/install-action@59012be0884e296ca2da49b530610e72c49039ad # v2.81.6
         with:
           tool: cargo-llvm-cov
 
