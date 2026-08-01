@@ -32,18 +32,36 @@ secret scan · fuzz build-check · per-line coverage gate.
 | `permissions:` block | **0 of 91** declared one | `contents: read`, workflow-wide |
 | Coverage gate | 6 implementations, 3 incompatible semantics | one implementation |
 
-### The pins were not just missing — one was fiction
+### The pins are sound; one provenance label is fiction
 
-`9bdad043e88c75890e36ad3bbc8d27f0090dd609` is pinned by ~36 fleet repos with the
-comment `# v2.7.8`. It is a **May 2024 mid-tree commit of `Swatinem/rust-cache`
-that matches no release tag at all** (`fix: usage of deprecated version of node`,
-PR #197). The real v2.7.8 is `9d47c6ad4b02e050fd481d890b2ea34778fd09d6`. The pin
-was honest; the version comment beside it was not, and a reviewer reading the
-comment would have concluded the repo was current.
+`9bdad043e88c75890e36ad3bbc8d27f0090dd609` appears in **56 fleet repos, across 87
+workflow files, 292 times** — 276 of those commented `# v2.7.8`, 16 commented
+`# v2`. It is a real `Swatinem/rust-cache` commit dated 2024-05-03 (`fix: usage of
+deprecated version of node`, PR #197), but it **matches no release tag**:
+
+| Tag | Commit |
+|---|---|
+| v2.7.3 | `23bce251a8cd2ffc3c1075eaa2367cf899916d84` |
+| v2.7.5 | `82a92a6e8fbeee089604da2575dc567ae9ddeaab` |
+| v2.7.7 | `f0deed1e0edfc6a9be95417288c0e1099b1eeec3` |
+| v2.7.8 | `9d47c6ad4b02e050fd481d890b2ea34778fd09d6` |
+| v2.8.0 | `98c8021b550208e191a6a3145459bfc9fb29c4c0` |
+
+**This is a traceability defect, not a vulnerability.** A SHA is immutable, so the
+security control is doing exactly its job — the pinned bytes cannot change under
+anyone. What fails is provenance: 56 repos run untagged mid-tree code while the
+comment beside it asserts a release. An audit answering *"are we on released
+versions?"* by reading those comments gets a wrong answer, and Renovate's
+digest-pinning may not map SHA→version cleanly either.
+
+Two repos — `orchestration/issen` and `parser/browser-forensic` — pin **both**
+SHAs in different workflows, so they are internally inconsistent about which
+`rust-cache` they run.
 
 Every SHA in `rust-ci.yml` was resolved with
 `gh api repos/<owner>/<repo>/commits/<tag> --jq .sha` at authoring time, so the
-comment and the bytes agree.
+comment and the bytes agree. `rust-cache` here is
+`c19371144df3bb44fab255c43d04cbc2ab54d1c4`, which is genuinely v2.9.1.
 
 ## The coverage gate
 
