@@ -135,6 +135,28 @@ env:
   # the jobs below rely on has to be declared right here.
 
 jobs:
+  # Runs first and cheapest, because when it fails every other job below fails
+  # too -- with an error that names a workspace member rather than the
+  # dependency that escaped. This job supplies the diagnosis those six or ten
+  # simultaneous failures do not.
+  path-deps:
+    name: Single-checkout buildability
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      # `job_workflow_sha` is the commit of THIS reusable workflow, so the
+      # script is fetched at exactly the revision the caller pinned -- not from
+      # a floating branch, and not at `deny-config-ref`, which belongs to a
+      # different repository.
+      - name: Fetch the check
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: SecurityRonin/fleet-ci
+          ref: ${{ github.job_workflow_sha }}
+          path: .fleet-ci
+      - name: No path dependency may escape the repository
+        run: python3 .fleet-ci/scripts/check_path_deps.py "$GITHUB_WORKSPACE"
+
   fmt:
     name: Format
     runs-on: ubuntu-latest
