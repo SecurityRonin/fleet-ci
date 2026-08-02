@@ -274,7 +274,12 @@ jobs:
       - uses: taiki-e/install-action@59012be0884e296ca2da49b530610e72c49039ad # v2.81.6
         with:
           tool: cargo-vet
-      - run: cargo fetch
+      # `--locked` here is load-bearing: a bare `cargo fetch` RE-RESOLVES and
+      # rewrites Cargo.lock in the runner, so the `--locked` on the next line
+      # would validate a lock CI just generated for itself rather than the
+      # committed bytes. 80 of 81 fleet repos had this shape; blazehash's lock
+      # drifted from its manifest for seven weeks while this gate stayed green.
+      - run: cargo fetch --locked
       - run: cargo vet --locked
 
   secret-scan:
