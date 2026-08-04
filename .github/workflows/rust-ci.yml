@@ -120,6 +120,15 @@ on:
           when there is no fuzz/ directory, so this needs no per-repo wiring.
         type: boolean
         default: true
+      rustdoc-check:
+        description: >
+          Build rustdoc with warnings denied. Catches broken intra-doc links and
+          malformed doc attributes, which no other job here sees — clippy does
+          not read doc comments and the test job does not build docs. 37 of the
+          fleet's 92 repos already run this in their own ci.yml, so a repo
+          adopting this workflow would otherwise lose a gate it had.
+        type: boolean
+        default: true
 
 # The GITHUB_TOKEN gets read-only repository access and nothing else. A called
 # workflow can never hold more than its caller grants, so the caller declares
@@ -402,6 +411,23 @@ jobs:
             (cd "$dir" && cargo +nightly fuzz build)
             echo "::endgroup::"
           done < /tmp/fuzz_dirs.txt
+
+  docs:
+    name: Docs
+    if: inputs.rustdoc-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@9bdad043e88c75890e36ad3bbc8d27f0090dd609 # v2.7.8
+      # `--no-deps` keeps the gate on this workspace's own docs: a broken link in
+      # a dependency is not this repo's to fix and would make the gate red for
+      # something no one here can change.
+      - run: cargo doc --no-deps --workspace ${{ inputs.all-features && '--all-features' || '' }}
+        env:
+          RUSTDOCFLAGS: -D warnings
 
   coverage:
     name: >-
