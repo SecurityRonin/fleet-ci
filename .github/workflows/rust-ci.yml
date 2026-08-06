@@ -521,8 +521,14 @@ jobs:
           f="--workspace"
           [ '${{ inputs.coverage-scope }}' = 'lib' ] && f="$f --lib"
           [ '${{ inputs.all-features }}' = 'true' ] && f="$f --all-features"
-          ignore='${{ inputs.coverage-ignore-regex }}'
-          [ -n "$ignore" ] && f="$f --ignore-filename-regex $ignore"
+          # The regex is deliberately NOT folded into this flag string. GitHub
+          # substitutes workflow expressions into the SCRIPT TEXT, so a value with regex
+          # metacharacters — the fleet's own `(^|/)src/(main\.rs|bin/)` — reaches
+          # bash as syntax and the job dies with
+          #   syntax error near unexpected token `('
+          # before cargo ever runs. That reads like a coverage failure and is not
+          # one. Each llvm-cov step takes the value through `env:` instead, where
+          # normal shell quoting applies.
           echo "flags=$f" >> "$GITHUB_OUTPUT"
           echo "cargo llvm-cov $f"
 
@@ -530,18 +536,32 @@ jobs:
       - name: Aggregate line floor
         if: inputs.coverage-gate == 'floor'
         shell: bash
+        env:
+          COV_IGNORE: ${{ inputs.coverage-ignore-regex }}
         run: |
           echo "::warning::This repo is on the aggregate coverage FLOOR (${{ inputs.coverage-floor }}%), not the fleet per-line gate. An aggregate percentage cannot honour a '// cov:unreachable' exemption, so it neither identifies which lines are uncovered nor lets a provably-dead guard be annotated instead of deleted. Migrate to coverage-gate: strict."
-          cargo llvm-cov ${{ steps.flags.outputs.flags }} --summary-only --fail-under-lines ${{ inputs.coverage-floor }}
+          ig=()
+          [ -n "${COV_IGNORE:-}" ] && ig=(--ignore-filename-regex "$COV_IGNORE")
+          cargo llvm-cov ${{ steps.flags.outputs.flags }} "${ig[@]}" --summary-only --fail-under-lines ${{ inputs.coverage-floor }}
       - name: Show missing lines (advisory)
         if: inputs.coverage-gate == 'floor'
         continue-on-error: true
-        run: cargo llvm-cov ${{ steps.flags.outputs.flags }} --summary-only --show-missing-lines
+        env:
+          COV_IGNORE: ${{ inputs.coverage-ignore-regex }}
+        run: |
+          ig=()
+          [ -n "${COV_IGNORE:-}" ] && ig=(--ignore-filename-regex "$COV_IGNORE")
+          cargo llvm-cov ${{ steps.flags.outputs.flags }} "${ig[@]}" --summary-only --show-missing-lines
 
       # -- THE FLEET GATE ------------------------------------------------------
       - name: Generate lcov
         if: inputs.coverage-gate == 'strict'
-        run: cargo llvm-cov ${{ steps.flags.outputs.flags }} --lcov --output-path lcov.info
+        env:
+          COV_IGNORE: ${{ inputs.coverage-ignore-regex }}
+        run: |
+          ig=()
+          [ -n "${COV_IGNORE:-}" ] && ig=(--ignore-filename-regex "$COV_IGNORE")
+          cargo llvm-cov ${{ steps.flags.outputs.flags }} "${ig[@]}" --lcov --output-path lcov.info
 
       - name: Enforce per-line coverage
         if: inputs.coverage-gate == 'strict'
