@@ -19,8 +19,12 @@ checkout resolves the path happily, so this is the only way to observe the
 single-checkout property from a developer machine.
 
 Exits 0 when clean, 1 when a path dependency escapes, 2 when the check itself
-could not do its work (no manifests found, or no path dependencies extracted) --
-a check that inspected nothing must never report success.
+could not do its work (no manifests found, or the extractor fails its own
+self-test) -- a check that inspected nothing must never report success.
+
+Zero path dependencies is NOT an error: a single-crate repo legitimately has
+none. The inert-extractor worry is answered by a self-test against a fixture
+with known path deps, not by assuming the repo under test has any.
 """
 
 from __future__ import annotations
@@ -100,6 +104,31 @@ def manifests(root: Path) -> list[Path]:
     return sorted(found)
 
 
+def extractor_self_test() -> bool:
+    """Prove the extractor reads dependency tables, without assuming this repo has any.
+
+    The original guard failed the build whenever a repo yielded zero path
+    dependencies, on the reasoning that a silent extractor is indistinguishable
+    from a clean repo. That is the right worry and the wrong test: a
+    single-crate repo with no path dependencies is perfectly normal, and
+    forensic-vfs-mount failed this check for having nothing to find.
+
+    So the self-test runs against a fixture with a KNOWN path dependency in each
+    of the table shapes that exist. If the extractor cannot pull them out of
+    this, it is broken; if it can, then "zero found" in the repo means zero are
+    there.
+    """
+    fixture = {
+        "dependencies": {"a": {"path": "../a"}},
+        "dev-dependencies": {"b": {"path": "../b"}},
+        "build-dependencies": {"c": {"path": "../c"}},
+        "target": {"cfg(unix)": {"dependencies": {"d": {"path": "../d"}}}},
+        "workspace": {"dependencies": {"e": {"path": "../e"}}},
+    }
+    names = {name for name, _ in path_dependencies(fixture)}
+    return names == {"a", "b", "c", "d", "e"}
+
+
 def main() -> int:
     root = normalize(PurePath(Path(sys.argv[1] if len(sys.argv) > 1 else ".").absolute()))
     found = manifests(Path(root))
@@ -129,11 +158,11 @@ def main() -> int:
                     f"     resolves to {resolved}"
                 )
 
-    if checked == 0:
+    if checked == 0 and not extractor_self_test():
         print(
-            f"error: {count(len(found), 'manifest')} found but zero path dependencies "
-            "extracted -- the extractor is not reading dependency tables, so "
-            "this check is inert.",
+            "error: the path-dependency extractor failed its own self-test -- it "
+            "cannot read a dependency table it is handed directly, so a pass here "
+            "would prove nothing.",
             file=sys.stderr,
         )
         return 2
