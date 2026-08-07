@@ -107,12 +107,24 @@ on:
         default: true
       deny-config-repo:
         description: >
-          Repo holding the shared deny.toml (cargo-deny has no include/extends
-          mechanism — v0.19.0 offers only `-c/--config` — so the shared config
-          is fetched and passed by path). Set to "" to use the repo's own
-          local deny.toml instead.
+          Repo holding a SHARED deny.toml, e.g. "SecurityRonin/fleet-config".
+          Empty (the DEFAULT) uses the repository's own deny.toml.
+
+          The default is empty deliberately. It used to point at fleet-config,
+          which meant adopting this workflow silently swapped every repo's
+          supply-chain policy for the shared one. Measured when that was caught:
+          61 of 65 adopted repos had `ignore = []` locally and inherited 21
+          advisory ignores — among them RUSTSEC-2023-0071 (rsa Marvin timing
+          attack) — none carrying a reason or a removal condition. Several also
+          went from `multiple-versions = "deny"` to `"warn"` and gained 9 allowed
+          licences.
+
+          A repo's own deny.toml is its deliberate policy. Replacing it is a
+          supply-chain decision that deserves its own PR and its own argument,
+          not a side effect of moving onto shared CI. Set this input explicitly
+          to opt in.
         type: string
-        default: SecurityRonin/fleet-config
+        default: ""
       deny-config-ref:
         description: Ref of `deny-config-repo` to check out. Pin to a SHA in production.
         type: string
@@ -381,6 +393,15 @@ jobs:
             set -x
             cargo deny "${globals[@]}" check --config "$cfg" all
           else
+            # Symmetric to the shared-config guard above: a missing config must
+            # never become a silent pass. Without deny.toml cargo-deny falls back
+            # to its built-in defaults, which are neither this repo's policy nor
+            # the fleet's -- exactly the "pass against a config nobody chose" this
+            # job refuses in the other direction.
+            if [ ! -f deny.toml ]; then
+              echo "::error::no deny.toml in this repository and no deny-config-repo set. Refusing to run against cargo-deny's built-in defaults -- that would report a pass against a config nobody chose. Add a deny.toml, or set deny-config-repo to opt into the shared one."
+              exit 1
+            fi
             echo "Using repo-local deny.toml"
             set -x
             cargo deny "${globals[@]}" check all
