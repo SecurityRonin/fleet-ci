@@ -235,9 +235,62 @@ jobs:
       - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
       - run: cargo test --workspace ${{ inputs.all-features && '--all-features' || '' }}
 
+  # One job PER MEMBER, each built at the floor that member declares.
+  #
+  # This previously took min(member rust-version) and built --workspace at it.
+  # That is correct only when every member shares one floor. Where members
+  # legitimately differ -- one pulls a heavier dependency tree than another -- it
+  # demanded the HIGH-floor member compile at the LOW-floor member's version,
+  # which nothing promised and nothing can deliver. Observed live in
+  # chromium-storage-forensic: members declaring 1.80 / 1.87 / 1.88, all three
+  # truthful, all three red, because the job tried the whole workspace at 1.80
+  # and cargo died parsing a dependency's manifest on edition 2024.
+  #
+  # A declared rust-version is a promise made by THAT crate to ITS consumers.
+  # Verifying it means building THAT crate at THAT version. A single-floor
+  # workspace yields one matrix entry and behaves exactly as before; a
+  # heterogeneous one now verifies every promise instead of failing on a floor
+  # nobody ever made.
+  msrv-matrix:
+    name: MSRV (resolve)
+    runs-on: ubuntu-latest
+    outputs:
+      members: ${{ steps.resolve.outputs.members }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+      - name: Resolve per-member MSRV
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+          override='${{ inputs.msrv }}'
+          if [ -n "$override" ]; then
+            members="$(jq -nc --arg v "$override" '[{name:"",msrv:$v}]')"
+            echo "MSRV (caller override, whole workspace): $override"
+          else
+            members="$(cargo metadata --no-deps --format-version 1 | jq -c '
+              [ .packages[] | select(.rust_version != null)
+                | {name: .name, msrv: .rust_version} ] | unique_by(.name)')"
+            if [ "$members" = "[]" ]; then
+              echo "::error::no workspace member declares rust-version. Add one to Cargo.toml, or set this workflow's msrv input explicitly - this job refuses to guess a floor it would then claim to have verified."
+              exit 1
+            fi
+            echo "MSRV per member:"
+            echo "$members" | jq -r '.[] | "  " + .name + ": " + .msrv'
+          fi
+          echo "members=$members" >> "$GITHUB_OUTPUT"
+
   msrv:
     name: MSRV
+    needs: msrv-matrix
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        member: ${{ fromJSON(needs.msrv-matrix.outputs.members) }}
     steps:
       - name: Install system packages
         if: inputs.system-packages != '' && runner.os == 'Linux'
@@ -249,42 +302,27 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
-          toolchain: stable
-      # Derive the floor from the workspace itself unless the caller overrode
-      # it. Restating the MSRV in CI is how a repo ends up verifying 1.85 while
-      # promising 1.81 to downstreams; reading it makes that impossible.
-      - name: Resolve MSRV
-        id: resolve
+          toolchain: ${{ matrix.member.msrv }}
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+      # The explicit `+<version>` beats rust-toolchain.toml's pin, which is the
+      # DEV toolchain rather than the floor. Without it this job silently
+      # verifies the wrong thing. An empty member name means a caller override,
+      # so the scope is the whole workspace.
+      - name: Build at the declared floor
         shell: bash
+        env:
+          MEMBER: ${{ matrix.member.name }}
+          MSRV: ${{ matrix.member.msrv }}
+          CHECK: ${{ inputs.msrv-check }}
+          ALLF: ${{ inputs.all-features }}
         run: |
           set -euo pipefail
-          override='${{ inputs.msrv }}'
-          if [ -n "$override" ]; then
-            echo "msrv=$override" >> "$GITHUB_OUTPUT"
-            echo "MSRV (caller override): $override"
-            exit 0
-          fi
-          # Lowest rust-version across workspace members is the floor the whole
-          # workspace can actually be built at. Sorted numerically per component,
-          # so 1.9 does not rank above 1.85 the way a string sort would.
-          msrv="$(cargo metadata --no-deps --format-version 1 | jq -r '
-            [.packages[].rust_version | select(. != null)]
-            | sort_by(split(".") | map(tonumber))
-            | first // ""')"
-          if [ -z "$msrv" ]; then
-            echo "::error::no workspace member declares rust-version. Add one to Cargo.toml, or set the reusable workflow's msrv input explicitly — this job refuses to guess a floor it would then claim to have verified."
-            exit 1
-          fi
-          echo "msrv=$msrv" >> "$GITHUB_OUTPUT"
-          echo "MSRV (derived from rust-version): $msrv"
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
-        with:
-          toolchain: ${{ steps.resolve.outputs.msrv }}
-      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
-      # An explicit `+<version>` beats rust-toolchain.toml's pin (which is the
-      # dev toolchain, not the floor). Without it the pin silently wins and the
-      # job verifies nothing.
-      - run: cargo +${{ steps.resolve.outputs.msrv }} ${{ inputs.msrv-check }} --workspace ${{ inputs.all-features && '--all-features' || '' }}
+          scope=(--workspace)
+          if [ -n "${MEMBER:-}" ]; then scope=(-p "$MEMBER"); fi
+          feats=()
+          if [ "$ALLF" = "true" ]; then feats=(--all-features); fi
+          echo "verifying ${MEMBER:-<workspace>} at its declared floor $MSRV"
+          cargo "+$MSRV" "$CHECK" "${scope[@]}" "${feats[@]}"
 
   deny:
     name: cargo-deny
