@@ -31,6 +31,22 @@ on:
         description: Run the test job on ubuntu + macos + windows.
         type: boolean
         default: true
+      test-os:
+        description: >
+          Explicit runner list for the test job, as a JSON array — e.g.
+          '["ubuntu-latest","macos-latest"]'. Overrides `os-matrix` when set.
+
+          `os-matrix` is a boolean, so it can only say "all three" or
+          "ubuntu only". A repo that legitimately tests on ubuntu AND macos but
+          not windows had no way to say so: true added an unsupported platform,
+          false silently dropped a supported one. Neither preserves the
+          decision, and an adoption PR that narrows a repo's tested platforms is
+          a behaviour change wearing a config change's clothes.
+
+          Empty (the default) leaves `os-matrix` in charge, so repos already
+          adopted are unaffected.
+        type: string
+        default: ""
       system-packages:
         description: >
           Space-separated apt packages to install before any job that links
@@ -219,7 +235,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ inputs.os-matrix && fromJSON('["ubuntu-latest","macos-latest","windows-latest"]') || fromJSON('["ubuntu-latest"]') }}
+        # test-os wins when set; otherwise the os-matrix boolean, unchanged.
+        os: ${{ inputs.test-os != '' && fromJSON(inputs.test-os) || (inputs.os-matrix && fromJSON('["ubuntu-latest","macos-latest","windows-latest"]') || fromJSON('["ubuntu-latest"]')) }}
     steps:
       - name: Install system packages
         if: inputs.system-packages != '' && runner.os == 'Linux'
