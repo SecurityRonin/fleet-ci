@@ -565,10 +565,14 @@ jobs:
           RUSTDOCFLAGS: -D warnings
 
   coverage:
-    name: >-
-      ${{ inputs.coverage-gate == 'floor'
-          && format('Coverage (FLOOR {0}% — migration debt, not the fleet gate)', inputs.coverage-floor)
-          || 'Coverage (100% lines)' }}
+    # STATIC name, deliberately. GitHub does not evaluate a job's `name:`
+    # expression when the job is SKIPPED -- it publishes the raw expression text
+    # as the check name instead, wrapped across lines. A repo passing
+    # `coverage-gate: "off"` therefore reported three garbage check runs
+    # (`ci / inputs.coverage-gate == 'floor'`, `&& format(...)`,
+    # `|| 'Coverage (100% lines)'`) rather than one skipped `Coverage`.
+    # Which gate ran is reported by the step-level ::warning::, not by the name.
+    name: Coverage
     if: inputs.coverage-gate != 'off'
     runs-on: ubuntu-latest
     steps:
@@ -743,4 +747,63 @@ jobs:
           if uncovered or bare_markers or unreadable:
               sys.exit(1)
           print("\nEvery executable line is covered, or carries a justified // cov:unreachable.")
+          PYGATE
+
+  # ---------------------------------------------------------------------------
+  # ONE STABLE CONTEXT FOR BRANCH PROTECTION
+  #
+  # Matrix jobs embed their matrix values in the published check name --
+  # `MSRV (sqlite-core, 1.80)`, `Test (ubuntu-latest)`. Requiring those directly
+  # in branch protection is a trap: the name changes when a crate is added or an
+  # MSRV floor is raised, the required context then never reports, and every PR
+  # in the repo becomes unmergeable with no visible cause.
+  #
+  # This job's name never varies, so it can be required once and stay valid.
+  # Require exactly `ci / All checks`.
+  gate:
+    name: All checks
+    needs:
+      - path-deps
+      - fmt
+      - clippy
+      - test
+      - msrv-matrix
+      - msrv
+      - deny
+      - vet
+      - secret-scan
+      - fuzz-build
+      - docs
+      - coverage
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every required job succeeded (or was deliberately skipped)
+        shell: bash
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$RESULTS"
+          python3 - "$RESULTS" <<'PYGATE'
+          import json, sys
+          results = json.loads(sys.argv[1])
+          if not results:
+              print("::error::no job results reported -- this gate ran over nothing")
+              sys.exit(1)
+          bad = sorted(k for k, v in results.items()
+                       if v.get("result") not in ("success", "skipped"))
+          if bad:
+              print(f"::error::did not succeed: {', '.join(bad)}")
+              sys.exit(1)
+          # An empty check list means NOT RUN, never PASSED: a workflow where every
+          # job skipped would otherwise report green over zero work.
+          if not any(v.get("result") == "success" for v in results.values()):
+              print("::error::every job skipped -- nothing was actually verified")
+              sys.exit(1)
+          ok = sorted(k for k, v in results.items() if v.get("result") == "success")
+          skipped = sorted(k for k, v in results.items() if v.get("result") == "skipped")
+          print(f"succeeded: {', '.join(ok)}")
+          if skipped:
+              print(f"skipped:   {', '.join(skipped)}")
           PYGATE
