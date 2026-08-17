@@ -1,0 +1,156 @@
+name: Rust release
+
+# The fleet's release template.
+#
+# WHY THIS EXISTS: 16 repos carried hand-written release workflows between 29 and
+# 491 lines, no two alike. Twelve of the thirteen that cross-compile had the SAME
+# latent caching defect, and each would have had to be fixed separately. A shared
+# template makes that class impossible rather than repeatedly fixable.
+#
+# WHAT IT DELIBERATELY DOES NOT DO: it does not absorb every packaging quirk. A
+# repo needing something this does not express should keep its own workflow and
+# say why in a comment, rather than bending the template until it expresses
+# nothing clearly.
+
+on:
+  workflow_call:
+    inputs:
+      matrix:
+        description: >
+          JSON array of {target, os} objects, e.g.
+          '[{"target":"x86_64-unknown-linux-musl","os":"ubuntu-latest"}]'.
+          The build job fans out over this.
+        required: true
+        type: string
+      bin-name:
+        description: Binary name as installed, e.g. `mem4n6`.
+        required: true
+        type: string
+      cargo-cache:
+        description: >
+          Cache the release build. TRUE by default because a cold cross-compile of
+          a bundled-C++ dependency is measured in tens of minutes.
+
+          Set FALSE where the artifact's provenance must not depend on restored
+          compiled objects. That is a real trade, not a style choice: a release
+          binary is what ships and gets signed, and a cache is a mutable input to
+          it. A repo turning this off should say so in its caller.
+        type: boolean
+        default: true
+      publish-crate:
+        description: >
+          `cargo publish` on tag. Leave FALSE where release-plz owns publishing —
+          running both races two publishers at the same version.
+        type: boolean
+        default: false
+      extra-build-args:
+        description: Appended to `cargo build --release`, e.g. `--all-features`.
+        type: string
+        default: ""
+    secrets:
+      CARGO_REGISTRY_TOKEN:
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(inputs.matrix) }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # `key` IS THE POINT OF THIS TEMPLATE, not a tuning knob.
+      #
+      # rust-cache keys on the RUNNER OS/ARCH, not on the Rust --target. A matrix
+      # that cross-compiles several targets onto one runner gives every such job
+      # the SAME key: they overwrite each other, each restores the other's
+      # artifacts, finds nothing usable, and rebuilds from cold. Permanently,
+      # while every build still passes. The only symptom is time, which is why it
+      # survived in 12 of 13 fleet release workflows.
+      #
+      # The rule: collision iff distinct target triples > distinct runner OSes.
+      # Keying by target makes it impossible regardless of matrix shape.
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+        if: inputs.cargo-cache
+        with:
+          key: ${{ matrix.target }}
+          cache-on-failure: true
+
+      - name: Build
+        shell: bash
+        run: cargo build --release --target ${{ matrix.target }} ${{ inputs.extra-build-args }}
+
+      - name: Stage artifact
+        id: stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="${{ inputs.bin-name }}"
+          src="target/${{ matrix.target }}/release/$bin"
+          [ "${{ runner.os }}" = "Windows" ] && src="$src.exe"
+          # Refuse loudly rather than upload an empty artifact: a release that
+          # ships nothing looks identical to one that ships something, until a
+          # user runs it.
+          [ -f "$src" ] || { echo "::error::expected binary not found at $src"; exit 1; }
+          mkdir -p dist
+          out="dist/${bin}-${{ matrix.target }}"
+          [ "${{ runner.os }}" = "Windows" ] && out="$out.exe"
+          cp "$src" "$out"
+          echo "path=$out" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ inputs.bin-name }}-${{ matrix.target }}
+          path: ${{ steps.stage.outputs.path }}
+          if-no-files-found: error
+
+  release:
+    name: GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Verify something was actually produced
+        shell: bash
+        run: |
+          set -euo pipefail
+          n="$(find dist -type f | wc -l)"
+          echo "artifacts: $n"
+          # An empty artifact set means NOT BUILT, never "nothing to release".
+          [ "$n" -gt 0 ] || { echo "::error::no artifacts downloaded"; exit 1; }
+          find dist -type f -exec sha256sum {} +  | tee dist/SHA256SUMS
+
+      - uses: softprops/action-gh-release@72f2c25fcb47643c292f7107632f7a47c1df5cd8 # v2.3.2
+        with:
+          files: dist/*
+          fail_on_unmatched_files: true
+
+  crate:
+    name: Publish crate
+    needs: release
+    if: inputs.publish-crate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+        if: inputs.cargo-cache
+        with:
+          cache-on-failure: true
+      - run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

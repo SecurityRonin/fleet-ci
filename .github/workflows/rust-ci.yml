@@ -239,6 +239,8 @@ jobs:
           toolchain: stable
           components: clippy
       - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+        with:
+          cache-on-failure: true
       - run: cargo clippy --workspace --all-targets ${{ inputs.all-features && '--all-features' || '' }} -- -D warnings
 
   test:
@@ -262,6 +264,8 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+        with:
+          cache-on-failure: true
       - run: cargo test --workspace ${{ inputs.all-features && '--all-features' || '' }}
 
   # One job PER MEMBER, each built at the floor that member declares.
@@ -333,6 +337,9 @@ jobs:
         with:
           toolchain: ${{ matrix.member.msrv }}
       - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+        with:
+          cache-on-failure: true
+          key: ${{ matrix.member.name }}
       # The explicit `+<version>` beats rust-toolchain.toml's pin, which is the
       # DEV toolchain rather than the floor. Without it this job silently
       # verifies the wrong thing. An empty member name means a caller override,
@@ -556,7 +563,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@9bdad043e88c75890e36ad3bbc8d27f0090dd609 # v2.7.8
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+        with:
+          cache-on-failure: true
       # `--no-deps` keeps the gate on this workspace's own docs: a broken link in
       # a dependency is not this repo's to fix and would make the gate red for
       # something no one here can change.
@@ -589,6 +598,8 @@ jobs:
           toolchain: stable
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+        with:
+          cache-on-failure: true
       - uses: taiki-e/install-action@59012be0884e296ca2da49b530610e72c49039ad # v2.81.6
         with:
           tool: cargo-llvm-cov
