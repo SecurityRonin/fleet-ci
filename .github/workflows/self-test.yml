@@ -1,0 +1,61 @@
+# fleet-ci had no CI of its own: the workflow 83 repos depend on was edited with
+# nothing checking it. A syntax error here is a fleet-wide outage, and a logic
+# error in the coverage gate is worse — it reports green over work it did not do.
+name: self-test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Self-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Workflows parse
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import sys, yaml, pathlib
+          for p in sorted(pathlib.Path(".github/workflows").glob("*.yml")):
+              try:
+                  yaml.safe_load(p.read_text())
+              except yaml.YAMLError as exc:
+                  print(f"::error file={p}::does not parse: {exc}")
+                  sys.exit(1)
+              print(f"ok  {p}")
+          PY
+      - name: Coverage gate control matrix
+        run: python3 tests/test_coverage_gate.py
+      - name: Gate mutation control
+        # A control matrix that has only ever passed is not known to work. Break
+        # the gate on purpose and require the suite to notice; the mutation
+        # asserts it applied first, because a no-op replace would report green.
+        run: |
+          set -euo pipefail
+          cp .github/workflows/rust-ci.yml /tmp/rust-ci.bak
+          python3 - <<'PY'
+          import sys
+          p = ".github/workflows/rust-ci.yml"
+          s = open(p).read()
+          old = 'gate_functions = metric in ("functions", "both")'
+          if old not in s:
+              print("::error::mutation target not found — this control would test nothing")
+              sys.exit(1)
+          open(p, "w").write(s.replace(old, "gate_functions = False"))
+          PY
+          if python3 tests/test_coverage_gate.py > /tmp/mutated.log 2>&1; then
+            cp /tmp/rust-ci.bak .github/workflows/rust-ci.yml
+            echo "::error::the control matrix PASSED against a deliberately broken gate"
+            exit 1
+          fi
+          cp /tmp/rust-ci.bak .github/workflows/rust-ci.yml
+          echo "mutation was detected, as required:"
+          tail -3 /tmp/mutated.log
+          git diff --exit-code --quiet .github/workflows/rust-ci.yml

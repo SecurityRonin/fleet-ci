@@ -89,13 +89,46 @@ on:
         default: 100
       coverage-scope:
         description: >
-          `workspace` — all members, all test targets (unit + integration).
-          `lib`       — `--workspace --lib`, unit tests only. Under-counts any
-                        repo whose oracle/differential suites live in tests/.
+          What gets MEASURED.
+          `workspace`      — all members, all test targets (unit + integration).
+          `lib`            — `--workspace --lib`, unit tests only. Under-counts any
+                             repo whose oracle/differential suites live in tests/.
+          `package:<name>` — one member (`-p <name>`), for an umbrella workspace
+                             where only one crate carries the gated surface.
         type: string
         default: workspace
+      coverage-metric:
+        description: >
+          What must be COVERED. `lines` (default, the historical behaviour),
+          `functions`, or `both`.
+
+          Lines alone are blind to a function that is never entered while its
+          lines are covered by another monomorphized instance of the same
+          generic: llvm-cov emits one FN record per instantiation but one DA
+          record per source line, so a reader-generic crate can sit at 100%
+          lines with instantiations nobody ever called. Repos whose invariant
+          is "every instantiation is exercised" want `functions` or `both`.
+        type: string
+        default: lines
       coverage-ignore-regex:
-        description: Passed to `--ignore-filename-regex` when non-empty.
+        description: Passed to `--ignore-filename-regex` when non-empty. Excludes from MEASUREMENT.
+        type: string
+        default: ""
+      coverage-include-regex:
+        description: >
+          Restricts WHERE the strict gate applies, to files whose path matches.
+          Empty (the default) gates everything measured.
+
+          This is the positive complement of `coverage-ignore-regex`, and it
+          exists because that input cannot express it: `--ignore-filename-regex`
+          is evaluated by the Rust regex crate, which has no lookahead, so
+          "gate only this path" is not writable as an exclusion. Files outside
+          the pattern are still measured — the reported numbers stay honest —
+          they are simply not gated, which is how a repo holds one published
+          surface at 100% while the rest carries tracked debt.
+
+          A pattern matching NO file in the report is an error, not a pass: a
+          gate running over zero files reports green having verified nothing.
         type: string
         default: ""
       require-exemption-reason:
@@ -596,11 +629,26 @@ jobs:
       - name: Assemble coverage flags
         id: flags
         shell: bash
+        env:
+          # Through env, never inlined: `package:<name>` is user-supplied text and
+          # GitHub substitutes expressions into the SCRIPT TEXT, so a crafted value
+          # would reach bash as syntax. Same reasoning as COV_IGNORE below.
+          COV_SCOPE: ${{ inputs.coverage-scope }}
         run: |
           set -euo pipefail
-          f="--workspace"
-          [ '${{ inputs.coverage-scope }}' = 'lib' ] && f="$f --lib"
-          [ '${{ inputs.all-features }}' = 'true' ] && f="$f --all-features"
+          case "$COV_SCOPE" in
+            workspace)  f="--workspace" ;;
+            lib)        f="--workspace --lib" ;;
+            package:*)  pkg="${COV_SCOPE#package:}"
+                        if [ -z "$pkg" ]; then
+                          echo "::error::coverage-scope 'package:' has no package name after the colon."
+                          exit 1
+                        fi
+                        f="-p $pkg" ;;
+            *)          echo "::error::coverage-scope must be 'workspace', 'lib' or 'package:<name>' — got '$COV_SCOPE'."
+                        exit 1 ;;
+          esac
+          [ '${{ inputs.all-features }}' = 'true' ] && f="$f --all-features" || true
           # The regex is deliberately NOT folded into this flag string. GitHub
           # substitutes workflow expressions into the SCRIPT TEXT, so a value with regex
           # metacharacters — the fleet's own `(^|/)src/(main\.rs|bin/)` — reaches
@@ -618,11 +666,22 @@ jobs:
         shell: bash
         env:
           COV_IGNORE: ${{ inputs.coverage-ignore-regex }}
+          COV_METRIC: ${{ inputs.coverage-metric }}
+          COV_FLOOR: ${{ inputs.coverage-floor }}
         run: |
+          set -euo pipefail
           echo "::warning::This repo is on the aggregate coverage FLOOR (${{ inputs.coverage-floor }}%), not the fleet per-line gate. An aggregate percentage cannot honour a '// cov:unreachable' exemption, so it neither identifies which lines are uncovered nor lets a provably-dead guard be annotated instead of deleted. Migrate to coverage-gate: strict."
           ig=()
-          [ -n "${COV_IGNORE:-}" ] && ig=(--ignore-filename-regex "$COV_IGNORE")
-          cargo llvm-cov ${{ steps.flags.outputs.flags }} "${ig[@]}" --summary-only --fail-under-lines ${{ inputs.coverage-floor }}
+          [ -n "${COV_IGNORE:-}" ] && ig=(--ignore-filename-regex "$COV_IGNORE") || true
+          under=()
+          case "$COV_METRIC" in
+            lines)     under=(--fail-under-lines "$COV_FLOOR") ;;
+            functions) under=(--fail-under-functions "$COV_FLOOR") ;;
+            both)      under=(--fail-under-lines "$COV_FLOOR" --fail-under-functions "$COV_FLOOR") ;;
+            *)         echo "::error::coverage-metric must be lines, functions or both — got '$COV_METRIC'."
+                       exit 1 ;;
+          esac
+          cargo llvm-cov ${{ steps.flags.outputs.flags }} "${ig[@]}" --summary-only "${under[@]}"
       - name: Show missing lines (advisory)
         if: inputs.coverage-gate == 'floor'
         continue-on-error: true
@@ -648,6 +707,8 @@ jobs:
         shell: bash
         env:
           REQUIRE_REASON: ${{ inputs.require-exemption-reason }}
+          COV_METRIC: ${{ inputs.coverage-metric }}
+          COV_INCLUDE: ${{ inputs.coverage-include-regex }}
         run: |
           python3 - lcov.info <<'PYGATE'
           import os, re, sys
@@ -667,15 +728,43 @@ jobs:
           #     so this hides no untested logic.
           #
           # Anything else with a zero hit count is an uncovered line and fails.
+          #
+          # `coverage-metric` selects WHAT must be covered. Lines alone are blind to a
+          # function that is never entered while its lines are covered by another
+          # monomorphized instance of the same generic — llvm-cov emits one FN record
+          # per instantiation but one DA record per source line. A reader-generic crate
+          # can therefore sit at 100% lines with instantiations nobody ever called.
+          #
+          # `coverage-include-regex` selects WHERE the gate applies. It is the positive
+          # complement of `coverage-ignore-regex`, and it exists because that one cannot
+          # express it: `--ignore-filename-regex` is evaluated by the Rust regex crate,
+          # which has no lookahead, so "gate only this path" is not writable as an
+          # exclusion. Files outside it are still MEASURED — the reported numbers stay
+          # honest — they are simply not gated.
 
           lcov_path = sys.argv[1]
           require_reason = os.environ.get("REQUIRE_REASON") == "true"
+          metric = (os.environ.get("COV_METRIC") or "lines").strip()
+          include_raw = (os.environ.get("COV_INCLUDE") or "").strip()
+
+          if metric not in ("lines", "functions", "both"):
+              print(f"::error::coverage-metric must be lines, functions or both — got {metric!r}")
+              sys.exit(1)
+
+          try:
+              include_re = re.compile(include_raw) if include_raw else None
+          except re.error as exc:
+              print(f"::error::coverage-include-regex is not a valid regex ({exc}): {include_raw!r}")
+              sys.exit(1)
+
+          gate_lines = metric in ("lines", "both")
+          gate_functions = metric in ("functions", "both")
 
           DELIM_ONLY = re.compile(r"^[}\)\];,?]*$")
           # Matched as a bare substring, not anchored to `//`. The fleet writes the
           # marker in a line comment, a trailing block comment (`/* ... */`), and a
           # doc comment; anchoring to one syntax silently drops the others back into
-          # the failure set. The 36 existing shell gates already match this way.
+          # the failure set.
           MARKER = re.compile(r"cov:unreachable(?P<reason>\s*:\s*\S.*)?")
 
           src_cache = {}
@@ -693,16 +782,47 @@ jobs:
               return lines[n - 1] if 0 < n <= len(lines) else None
 
           uncovered, exempt_annotated, exempt_delim, bare_markers, unreadable = [], [], [], [], []
+          uncovered_fns, exempt_fns = [], []
+          gated_files, skipped_files = set(), set()
           current = None
+          gated = False
+          fn_line = {}
 
           with open(lcov_path, encoding="utf-8", errors="replace") as fh:
               for raw in fh:
                   raw = raw.rstrip("\n")
                   if raw.startswith("SF:"):
                       current = raw[3:]
+                      gated = include_re.search(current) is not None if include_re else True
+                      (gated_files if gated else skipped_files).add(current)
+                      fn_line = {}
                       continue
+                  if current is None or not gated:
+                      continue
+
+                  m = re.match(r"^FN:(\d+),(.+)$", raw)
+                  if m:
+                      fn_line[m.group(2)] = int(m.group(1))
+                      continue
+
+                  m = re.match(r"^FNDA:0,(.+)$", raw)
+                  if m and gate_functions:
+                      name = m.group(1)
+                      n = fn_line.get(name)
+                      if n is None:
+                          # A hit record with no matching FN declaration: we cannot point at
+                          # a source line, so we cannot let it pass unexamined either.
+                          uncovered_fns.append((current, 0, name))
+                          continue
+                      src = source_line(current, n)
+                      if src is not None and MARKER.search(src):
+                          exempt_fns.append((current, n, name))
+                      else:
+                          uncovered_fns.append((current, n, name))
+                      continue
+
                   m = re.match(r"^DA:(\d+),0$", raw)
-                  if not m or current is None:
+                  if not m or not gate_lines:
                       continue
                   n = int(m.group(1))
                   src = source_line(current, n)
@@ -723,8 +843,20 @@ jobs:
                   else:
                       uncovered.append((current, n, src.strip()))
 
+          # A scope that matches nothing is a gate running over zero files. That reports
+          # green while verifying nothing, so it is an error rather than a pass.
+          if include_re is not None and not gated_files:
+              print(f"::error::coverage-include-regex {include_raw!r} matched none of the "
+                    f"{len(skipped_files)} file(s) in the coverage report — this gate would "
+                    f"run over nothing. Fix the pattern, or remove it to gate everything.")
+              sys.exit(1)
+
           for path, n, src in uncovered:
               print(f"::error file={path},line={n}::uncovered line: {src}")
+          for path, n, name in uncovered_fns:
+              where = f"file={path},line={n}" if n else f"file={path}"
+              print(f"::error {where}::function never entered: {name}. Every monomorphized "
+                    f"instance must be exercised, or annotated '// cov:unreachable: <why>'.")
           for path, n, src in bare_markers:
               print(f"::error file={path},line={n}::bare '// cov:unreachable' with no invariant. "
                     f"Write '// cov:unreachable: <why this is provably dead>' — the marker asserts "
@@ -733,20 +865,25 @@ jobs:
               print(f"::error::lcov reports {path}:{n} uncovered but the source file could not be read; "
                     f"refusing to treat an unverifiable line as covered.")
 
-          print(f"\nuncovered: {len(uncovered)}  "
+          print(f"\nmetric: {metric}   gated files: {len(gated_files)}"
+                + (f"   not gated (still measured): {len(skipped_files)}" if include_re else ""))
+          print(f"uncovered lines: {len(uncovered)}  "
+                f"uncovered functions: {len(uncovered_fns)}  "
                 f"bare markers: {len(bare_markers)}  "
                 f"unreadable: {len(unreadable)}")
-          print(f"exempt (// cov:unreachable): {len(exempt_annotated)}  "
+          print(f"exempt (// cov:unreachable): {len(exempt_annotated) + len(exempt_fns)}  "
                 f"exempt (delimiter artifact): {len(exempt_delim)}")
 
-          if exempt_annotated:
+          if exempt_annotated or exempt_fns:
               print("\nAnnotated exemptions (each asserts a dominating invariant):")
               for path, n, src in exempt_annotated:
                   print(f"  {path}:{n}: {src}")
+              for path, n, name in exempt_fns:
+                  print(f"  {path}:{n}: (function) {name}")
 
-          if uncovered or bare_markers or unreadable:
+          if uncovered or uncovered_fns or bare_markers or unreadable:
               sys.exit(1)
-          print("\nEvery executable line is covered, or carries a justified // cov:unreachable.")
+          print("\nEvery gated line and function is covered, or carries a justified // cov:unreachable.")
           PYGATE
 
   # ---------------------------------------------------------------------------
