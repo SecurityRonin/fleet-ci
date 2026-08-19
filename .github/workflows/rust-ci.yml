@@ -191,6 +191,31 @@ on:
         type: string
         # renovate: datasource=github-releases depName=gitleaks/gitleaks
         default: "8.30.1"
+      unsafe-audit:
+        description: >
+          Assert every workspace member EFFECTIVELY forbids or denies
+          `unsafe_code`. Default true.
+
+          This is not a re-check of what the compiler already guarantees. Where
+          the lint is in force, `unsafe` is a compile error and asserting its
+          absence would be a check that cannot fail. What nothing else verifies
+          is that the lint is in force AT ALL for each member: a `[lints]` table
+          in a member REPLACES workspace inheritance rather than extending it,
+          and a member with no `[lints]` table does not inherit at all, because
+          inheritance is opt-in via `[lints] workspace = true`. Either way the
+          member compiles with `unsafe` permitted while the workspace root still
+          reads compliant.
+        type: boolean
+        default: true
+      unsafe-audit-exempt:
+        description: >
+          Comma- or newline-separated member names exempt from `unsafe-audit`,
+          for crates where the lint is genuinely impossible — a PyO3
+          `extension-module` or a wasm-bindgen shim generates `unsafe` it does
+          not own. Naming them here keeps the exemption visible and reviewable
+          instead of turning the whole gate off.
+        type: string
+        default: ""
       fuzz-build-check:
         description: >
           Build the fuzz targets when a `fuzz/` directory exists (a compile
@@ -509,6 +534,26 @@ jobs:
       # credential pasted into a commit message is invisible to this job. That
       # is what `git log --all --grep=<marker> -F` is for, and why commit
       # messages go through `git commit -F <file>`.
+
+  unsafe-audit:
+    name: Unsafe lint audit
+    if: inputs.unsafe-audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      # Same reasoning as path-deps: `job_workflow_sha` pins the script to the
+      # exact revision the caller pinned, never a floating branch.
+      - name: Fetch the check
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: SecurityRonin/fleet-ci
+          ref: ${{ github.job_workflow_sha }}
+          path: .fleet-ci
+      - name: Every member effectively forbids unsafe_code
+        shell: bash
+        env:
+          EXEMPT: ${{ inputs.unsafe-audit-exempt }}
+        run: python3 .fleet-ci/scripts/check_unsafe_lints.py "$GITHUB_WORKSPACE" "$EXEMPT"
 
   fuzz-build:
     name: Fuzz (build check)
@@ -909,6 +954,7 @@ jobs:
       - deny
       - vet
       - secret-scan
+      - unsafe-audit
       - fuzz-build
       - docs
       - coverage
