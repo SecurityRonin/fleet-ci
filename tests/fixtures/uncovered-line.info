@@ -1,0 +1,8 @@
+TN:
+SF:tests/fixtures/src/generic.rs
+FN:1,covered_fn
+FNDA:7,covered_fn
+DA:1,7
+DA:5,0
+DA:6,0
+end_of_record

@@ -1,0 +1,17 @@
+TN:
+SF:tests/fixtures/src/clean.rs
+FN:1,always_used
+FNDA:5,always_used
+DA:1,5
+end_of_record
+SF:tests/fixtures/src/dirty.rs
+FN:1,used
+FN:2,never_entered
+FN:3,dead_guard
+FNDA:5,used
+FNDA:0,never_entered
+FNDA:0,dead_guard
+DA:1,5
+DA:2,5
+DA:3,5
+end_of_record
