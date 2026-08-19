@@ -1,0 +1,9 @@
+# Its own [lints] table REPLACES inheritance rather than extending it, so
+# `unsafe_code` is not enforced here even though the workspace sets it.
+[package]
+name = "overriding-member"
+version = "0.0.0"
+edition = "2021"
+
+[lints.clippy]
+all = "warn"

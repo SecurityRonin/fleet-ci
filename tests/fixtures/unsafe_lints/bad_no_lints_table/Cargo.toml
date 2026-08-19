@@ -1,0 +1,6 @@
+[workspace]
+members = ["member"]
+resolver = "2"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"

@@ -33,6 +33,8 @@ jobs:
           PY
       - name: Coverage gate control matrix
         run: python3 tests/test_coverage_gate.py
+      - name: Unsafe lint audit control matrix
+        run: python3 tests/test_unsafe_lints.py
       - name: Gate mutation control
         # A control matrix that has only ever passed is not known to work. Break
         # the gate on purpose and require the suite to notice; the mutation

@@ -1,0 +1,6 @@
+# No [lints] table: workspace lints are OPT-IN, so `unsafe_code = "forbid"`
+# above never reaches this crate. The root manifest still reads compliant.
+[package]
+name = "unprotected-member"
+version = "0.0.0"
+edition = "2021"
