@@ -236,6 +236,19 @@ on:
           the published floor -- weakening a real promise to satisfy CI.
         type: string
         default: ""
+      package-check:
+        description: >
+          Assert every publishable crate packages README.md and a LICENSE file.
+          Default true; harmless for a repo that publishes nothing, since it
+          then has no crate to check.
+
+          `cargo package --list` is the only thing that shows what a consumer
+          actually receives. A README that exists in the repo but is excluded by
+          an `include` key reaches crates.io as a blank page, and nothing else in
+          CI looks. Five fleet repos hand-rolled this same job beside the shared
+          workflow, where the aggregate gate could not reach it.
+        type: boolean
+        default: true
       vet:
         description: Run `cargo vet` (supply-chain, unreviewed-code gate).
         type: boolean
@@ -806,6 +819,41 @@ jobs:
           EXEMPT: ${{ inputs.unsafe-audit-exempt }}
         run: python3 .fleet-ci/scripts/check_unsafe_lints.py "$GITHUB_WORKSPACE" "$EXEMPT"
 
+  package-check:
+    timeout-minutes: 20
+    name: Package completeness
+    if: inputs.package-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+      - name: README and LICENSE reach every published crate
+        shell: bash
+        run: |
+          set -euo pipefail
+          pkgs=$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c "import sys,json;[print(p['name']) for p in json.load(sys.stdin)['packages'] if p.get('publish') != []]")
+          if [ -z "$pkgs" ]; then
+            echo "No publishable crate in this workspace - nothing to check."
+            exit 0
+          fi
+          fail=0
+          for p in $pkgs; do
+            list=$(cargo package -p "$p" --list --allow-dirty)
+            if ! printf '%s\n' "$list" | grep -qx 'README.md'; then
+              echo "::error::$p does not package README.md - it reaches crates.io with a blank page"
+              fail=1
+            fi
+            if ! printf '%s\n' "$list" | grep -q '^LICENSE'; then
+              echo "::error::$p does not package a LICENSE file"
+              fail=1
+            fi
+            [ "$fail" -eq 0 ] && echo "ok  $p packages README.md and LICENSE"
+          done
+          exit "$fail"
+
   fuzz-build:
     timeout-minutes: ${{ inputs.job-timeout-minutes }}
     name: Fuzz (build check)
@@ -1366,6 +1414,7 @@ jobs:
       - vet
       - secret-scan
       - unsafe-audit
+      - package-check
       - fuzz-build
       - docs
       - coverage
