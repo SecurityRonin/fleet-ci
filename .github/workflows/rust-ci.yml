@@ -178,6 +178,17 @@ on:
           `targets = []`. Keep it empty unless the repo genuinely needs one.
         type: string
         default: ""
+      job-timeout-minutes:
+        description: >
+          Ceiling for the compiling jobs (clippy, test, msrv, fuzz-build,
+          coverage). Metadata and scan jobs are capped at 20 regardless.
+
+          A job with no ceiling inherits GitHub's six-hour default, which is not
+          a timeout so much as a way to lose a runner: a hung `apt-get update`
+          burned six hours across six repos before being cancelled. Raise this
+          for a repo that bundles heavy C/C++ rather than removing it.
+        type: number
+        default: 45
       vet:
         description: Run `cargo vet` (supply-chain, unreviewed-code gate).
         type: boolean
@@ -252,6 +263,7 @@ jobs:
   # dependency that escaped. This job supplies the diagnosis those six or ten
   # simultaneous failures do not.
   path-deps:
+    timeout-minutes: 20
     name: Single-checkout buildability
     runs-on: ubuntu-latest
     steps:
@@ -270,6 +282,7 @@ jobs:
         run: python3 .fleet-ci/scripts/check_path_deps.py "$GITHUB_WORKSPACE"
 
   fmt:
+    timeout-minutes: 20
     name: Format
     runs-on: ubuntu-latest
     steps:
@@ -281,6 +294,7 @@ jobs:
       - run: cargo fmt --all --check
 
   clippy:
+    timeout-minutes: ${{ inputs.job-timeout-minutes }}
     name: Clippy
     runs-on: ubuntu-latest
     steps:
@@ -289,8 +303,23 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y ${{ inputs.system-packages }}
+          # Bounded and retried, deliberately. `apt-get update` with no timeout
+          # hung on an unreachable Azure mirror and sat there until GitHub killed
+          # the job on its SIX HOUR limit -- six repos, one wasted runner each,
+          # and a red `ci / All checks` that looked like a code failure. A mirror
+          # being unreachable is infrastructure; it should fail in minutes and
+          # say so, not consume the job's entire budget.
+          attempt=1
+          until sudo timeout 300 apt-get update; do
+            if [ "$attempt" -ge 3 ]; then
+              echo "::error::apt-get update failed or timed out on all 3 attempts. The runner's package mirror is unreachable; this is infrastructure, not a code failure."
+              exit 1
+            fi
+            echo "::warning::apt-get update failed or timed out (attempt ${attempt}/3); retrying"
+            sleep $((attempt * 15))
+            attempt=$((attempt + 1))
+          done
+          sudo timeout 600 apt-get install -y ${{ inputs.system-packages }}
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
@@ -300,6 +329,7 @@ jobs:
       - run: cargo clippy --workspace --all-targets ${{ inputs.all-features && '--all-features' || '' }} -- -D warnings
 
   test:
+    timeout-minutes: ${{ inputs.job-timeout-minutes }}
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
@@ -313,8 +343,23 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y ${{ inputs.system-packages }}
+          # Bounded and retried, deliberately. `apt-get update` with no timeout
+          # hung on an unreachable Azure mirror and sat there until GitHub killed
+          # the job on its SIX HOUR limit -- six repos, one wasted runner each,
+          # and a red `ci / All checks` that looked like a code failure. A mirror
+          # being unreachable is infrastructure; it should fail in minutes and
+          # say so, not consume the job's entire budget.
+          attempt=1
+          until sudo timeout 300 apt-get update; do
+            if [ "$attempt" -ge 3 ]; then
+              echo "::error::apt-get update failed or timed out on all 3 attempts. The runner's package mirror is unreachable; this is infrastructure, not a code failure."
+              exit 1
+            fi
+            echo "::warning::apt-get update failed or timed out (attempt ${attempt}/3); retrying"
+            sleep $((attempt * 15))
+            attempt=$((attempt + 1))
+          done
+          sudo timeout 600 apt-get install -y ${{ inputs.system-packages }}
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
@@ -339,6 +384,7 @@ jobs:
   # heterogeneous one now verifies every promise instead of failing on a floor
   # nobody ever made.
   msrv-matrix:
+    timeout-minutes: 20
     name: MSRV (resolve)
     runs-on: ubuntu-latest
     outputs:
@@ -371,6 +417,7 @@ jobs:
           echo "members=$members" >> "$GITHUB_OUTPUT"
 
   msrv:
+    timeout-minutes: ${{ inputs.job-timeout-minutes }}
     name: MSRV
     needs: msrv-matrix
     runs-on: ubuntu-latest
@@ -384,8 +431,23 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y ${{ inputs.system-packages }}
+          # Bounded and retried, deliberately. `apt-get update` with no timeout
+          # hung on an unreachable Azure mirror and sat there until GitHub killed
+          # the job on its SIX HOUR limit -- six repos, one wasted runner each,
+          # and a red `ci / All checks` that looked like a code failure. A mirror
+          # being unreachable is infrastructure; it should fail in minutes and
+          # say so, not consume the job's entire budget.
+          attempt=1
+          until sudo timeout 300 apt-get update; do
+            if [ "$attempt" -ge 3 ]; then
+              echo "::error::apt-get update failed or timed out on all 3 attempts. The runner's package mirror is unreachable; this is infrastructure, not a code failure."
+              exit 1
+            fi
+            echo "::warning::apt-get update failed or timed out (attempt ${attempt}/3); retrying"
+            sleep $((attempt * 15))
+            attempt=$((attempt + 1))
+          done
+          sudo timeout 600 apt-get install -y ${{ inputs.system-packages }}
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
@@ -412,6 +474,7 @@ jobs:
           cargo "+$MSRV" "$CHECK" "${scope[@]}" "${feats[@]}"
 
   deny:
+    timeout-minutes: 20
     name: cargo-deny
     runs-on: ubuntu-latest
     steps:
@@ -466,6 +529,7 @@ jobs:
           fi
 
   vet:
+    timeout-minutes: 20
     name: cargo-vet
     if: inputs.vet
     runs-on: ubuntu-latest
@@ -475,8 +539,23 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y ${{ inputs.system-packages }}
+          # Bounded and retried, deliberately. `apt-get update` with no timeout
+          # hung on an unreachable Azure mirror and sat there until GitHub killed
+          # the job on its SIX HOUR limit -- six repos, one wasted runner each,
+          # and a red `ci / All checks` that looked like a code failure. A mirror
+          # being unreachable is infrastructure; it should fail in minutes and
+          # say so, not consume the job's entire budget.
+          attempt=1
+          until sudo timeout 300 apt-get update; do
+            if [ "$attempt" -ge 3 ]; then
+              echo "::error::apt-get update failed or timed out on all 3 attempts. The runner's package mirror is unreachable; this is infrastructure, not a code failure."
+              exit 1
+            fi
+            echo "::warning::apt-get update failed or timed out (attempt ${attempt}/3); retrying"
+            sleep $((attempt * 15))
+            attempt=$((attempt + 1))
+          done
+          sudo timeout 600 apt-get install -y ${{ inputs.system-packages }}
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
@@ -493,6 +572,7 @@ jobs:
       - run: cargo vet --locked
 
   secret-scan:
+    timeout-minutes: 20
     name: Secret Scan (gitleaks)
     if: inputs.secret-scan
     runs-on: ubuntu-latest
@@ -536,6 +616,7 @@ jobs:
       # messages go through `git commit -F <file>`.
 
   unsafe-audit:
+    timeout-minutes: 20
     name: Unsafe lint audit
     if: inputs.unsafe-audit
     runs-on: ubuntu-latest
@@ -556,6 +637,7 @@ jobs:
         run: python3 .fleet-ci/scripts/check_unsafe_lints.py "$GITHUB_WORKSPACE" "$EXEMPT"
 
   fuzz-build:
+    timeout-minutes: ${{ inputs.job-timeout-minutes }}
     name: Fuzz (build check)
     if: inputs.fuzz-build-check
     runs-on: ubuntu-latest
@@ -569,8 +651,23 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y ${{ inputs.system-packages }}
+          # Bounded and retried, deliberately. `apt-get update` with no timeout
+          # hung on an unreachable Azure mirror and sat there until GitHub killed
+          # the job on its SIX HOUR limit -- six repos, one wasted runner each,
+          # and a red `ci / All checks` that looked like a code failure. A mirror
+          # being unreachable is infrastructure; it should fail in minutes and
+          # say so, not consume the job's entire budget.
+          attempt=1
+          until sudo timeout 300 apt-get update; do
+            if [ "$attempt" -ge 3 ]; then
+              echo "::error::apt-get update failed or timed out on all 3 attempts. The runner's package mirror is unreachable; this is infrastructure, not a code failure."
+              exit 1
+            fi
+            echo "::warning::apt-get update failed or timed out (attempt ${attempt}/3); retrying"
+            sleep $((attempt * 15))
+            attempt=$((attempt + 1))
+          done
+          sudo timeout 600 apt-get install -y ${{ inputs.system-packages }}
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Detect fuzz crates
         id: detect
@@ -619,6 +716,7 @@ jobs:
           done < /tmp/fuzz_dirs.txt
 
   docs:
+    timeout-minutes: 20
     name: Docs
     if: inputs.rustdoc-check
     runs-on: ubuntu-latest
@@ -628,8 +726,23 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y ${{ inputs.system-packages }}
+          # Bounded and retried, deliberately. `apt-get update` with no timeout
+          # hung on an unreachable Azure mirror and sat there until GitHub killed
+          # the job on its SIX HOUR limit -- six repos, one wasted runner each,
+          # and a red `ci / All checks` that looked like a code failure. A mirror
+          # being unreachable is infrastructure; it should fail in minutes and
+          # say so, not consume the job's entire budget.
+          attempt=1
+          until sudo timeout 300 apt-get update; do
+            if [ "$attempt" -ge 3 ]; then
+              echo "::error::apt-get update failed or timed out on all 3 attempts. The runner's package mirror is unreachable; this is infrastructure, not a code failure."
+              exit 1
+            fi
+            echo "::warning::apt-get update failed or timed out (attempt ${attempt}/3); retrying"
+            sleep $((attempt * 15))
+            attempt=$((attempt + 1))
+          done
+          sudo timeout 600 apt-get install -y ${{ inputs.system-packages }}
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
@@ -643,6 +756,7 @@ jobs:
           RUSTDOCFLAGS: -D warnings
 
   coverage:
+    timeout-minutes: ${{ inputs.job-timeout-minutes }}
     # STATIC name, deliberately. GitHub does not evaluate a job's `name:`
     # expression when the job is SKIPPED -- it publishes the raw expression text
     # as the check name instead, wrapped across lines. A repo passing
@@ -659,8 +773,23 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y ${{ inputs.system-packages }}
+          # Bounded and retried, deliberately. `apt-get update` with no timeout
+          # hung on an unreachable Azure mirror and sat there until GitHub killed
+          # the job on its SIX HOUR limit -- six repos, one wasted runner each,
+          # and a red `ci / All checks` that looked like a code failure. A mirror
+          # being unreachable is infrastructure; it should fail in minutes and
+          # say so, not consume the job's entire budget.
+          attempt=1
+          until sudo timeout 300 apt-get update; do
+            if [ "$attempt" -ge 3 ]; then
+              echo "::error::apt-get update failed or timed out on all 3 attempts. The runner's package mirror is unreachable; this is infrastructure, not a code failure."
+              exit 1
+            fi
+            echo "::warning::apt-get update failed or timed out (attempt ${attempt}/3); retrying"
+            sleep $((attempt * 15))
+            attempt=$((attempt + 1))
+          done
+          sudo timeout 600 apt-get install -y ${{ inputs.system-packages }}
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
@@ -943,6 +1072,7 @@ jobs:
   # This job's name never varies, so it can be required once and stay valid.
   # Require exactly `ci / All checks`.
   gate:
+    timeout-minutes: 10
     name: All checks
     needs:
       - path-deps
