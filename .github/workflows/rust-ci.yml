@@ -189,6 +189,53 @@ on:
           for a repo that bundles heavy C/C++ rather than removing it.
         type: number
         default: 45
+      free-disk-space:
+        description: >
+          Reclaim ~30 GB on Linux runners before compiling. Default false.
+
+          For a workspace that bundles heavy C/C++ (DuckDB, RocksDB, wasmtime)
+          the runner's 14 GB is not enough and the build dies on "No space left
+          on device" -- which reads as a build failure and is a disk failure.
+          Costs ~2 minutes, so it is opt-in rather than always on.
+        type: boolean
+        default: false
+      system-packages-macos:
+        description: >
+          Packages to `brew install` on macOS runners. The `system-packages`
+          input is apt, so it is Linux-only; a repo whose macOS leg needs a
+          native tool had no way to say so and failed only on that leg.
+        type: string
+        default: ""
+      cargo-config:
+        description: >
+          Appended to `$CARGO_HOME/config.toml` before any compiling job.
+
+          The case this exists for: linking ~100 test binaries against ~800
+          crates plus bundled C++ exhausts the runner under the default linker
+          -- GNU ld SIGBUSes and mold deadlocks for six hours. Selecting lld is
+          a cargo-config concern, and there was no way to express it.
+        type: string
+        default: ""
+      build-env:
+        description: >
+          Newline-separated `KEY=VALUE` pairs exported to every compiling job.
+
+          Its companion case is `CARGO_PROFILE_TEST_DEBUG=0`: full debuginfo on
+          a large bundled-C++ workspace is what drives the linker out of memory,
+          so dropping it is the root-cause fix rather than a workaround.
+        type: string
+        default: ""
+      msrv-args:
+        description: >
+          Extra arguments for the MSRV job only, e.g. `--no-default-features`.
+
+          A lib+CLI hybrid commonly declares a low floor for the library while an
+          optional default feature pulls a dependency that needs more. Verifying
+          the promise means building WITHOUT that feature; with no way to say so
+          the MSRV job fails on a correct repo, and the only escape was raising
+          the published floor -- weakening a real promise to satisfy CI.
+        type: string
+        default: ""
       vet:
         description: Run `cargo vet` (supply-chain, unreviewed-code gate).
         type: boolean
@@ -298,6 +345,17 @@ jobs:
     name: Clippy
     runs-on: ubuntu-latest
     steps:
+      - name: Free disk space
+        if: inputs.free-disk-space && runner.os == 'Linux'
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+      - name: Install system packages (macOS)
+        if: inputs.system-packages-macos != '' && runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # `brew install` is already retried internally and bounded by the job
+          # ceiling; `--quiet` keeps the log readable.
+          brew install --quiet ${{ inputs.system-packages-macos }}
       - name: Install system packages
         if: inputs.system-packages != '' && runner.os == 'Linux'
         shell: bash
@@ -325,6 +383,32 @@ jobs:
         with:
           toolchain: stable
           components: clippy
+      - name: Apply cargo config and build env
+        if: inputs.cargo-config != '' || inputs.build-env != ''
+        shell: bash
+        env:
+          CARGO_CONFIG: ${{ inputs.cargo-config }}
+          BUILD_ENV: ${{ inputs.build-env }}
+        run: |
+          set -euo pipefail
+          # Through env, never inlined: both values are free-form text and GitHub
+          # substitutes expressions into the SCRIPT TEXT, where a quote or a
+          # bracket would reach bash as syntax.
+          if [ -n "${CARGO_CONFIG:-}" ]; then
+            mkdir -p "${CARGO_HOME:-$HOME/.cargo}"
+            printf '%s\n' "$CARGO_CONFIG" >> "${CARGO_HOME:-$HOME/.cargo}/config.toml"
+            echo "appended to ${CARGO_HOME:-$HOME/.cargo}/config.toml:"
+            printf '%s\n' "$CARGO_CONFIG"
+          fi
+          if [ -n "${BUILD_ENV:-}" ]; then
+            while IFS= read -r line; do
+              [ -z "$line" ] && continue
+              case "$line" in
+                *=*) printf '%s\n' "$line" >> "$GITHUB_ENV"; echo "exported: $line" ;;
+                *)   echo "::error::build-env line is not KEY=VALUE: $line"; exit 1 ;;
+              esac
+            done <<< "$BUILD_ENV"
+          fi
       - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
       - run: cargo clippy --workspace --all-targets ${{ inputs.all-features && '--all-features' || '' }} -- -D warnings
 
@@ -338,6 +422,17 @@ jobs:
         # test-os wins when set; otherwise the os-matrix boolean, unchanged.
         os: ${{ inputs.test-os != '' && fromJSON(inputs.test-os) || (inputs.os-matrix && fromJSON('["ubuntu-latest","macos-latest","windows-latest"]') || fromJSON('["ubuntu-latest"]')) }}
     steps:
+      - name: Free disk space
+        if: inputs.free-disk-space && runner.os == 'Linux'
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+      - name: Install system packages (macOS)
+        if: inputs.system-packages-macos != '' && runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # `brew install` is already retried internally and bounded by the job
+          # ceiling; `--quiet` keeps the log readable.
+          brew install --quiet ${{ inputs.system-packages-macos }}
       - name: Install system packages
         if: inputs.system-packages != '' && runner.os == 'Linux'
         shell: bash
@@ -364,6 +459,32 @@ jobs:
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
           toolchain: stable
+      - name: Apply cargo config and build env
+        if: inputs.cargo-config != '' || inputs.build-env != ''
+        shell: bash
+        env:
+          CARGO_CONFIG: ${{ inputs.cargo-config }}
+          BUILD_ENV: ${{ inputs.build-env }}
+        run: |
+          set -euo pipefail
+          # Through env, never inlined: both values are free-form text and GitHub
+          # substitutes expressions into the SCRIPT TEXT, where a quote or a
+          # bracket would reach bash as syntax.
+          if [ -n "${CARGO_CONFIG:-}" ]; then
+            mkdir -p "${CARGO_HOME:-$HOME/.cargo}"
+            printf '%s\n' "$CARGO_CONFIG" >> "${CARGO_HOME:-$HOME/.cargo}/config.toml"
+            echo "appended to ${CARGO_HOME:-$HOME/.cargo}/config.toml:"
+            printf '%s\n' "$CARGO_CONFIG"
+          fi
+          if [ -n "${BUILD_ENV:-}" ]; then
+            while IFS= read -r line; do
+              [ -z "$line" ] && continue
+              case "$line" in
+                *=*) printf '%s\n' "$line" >> "$GITHUB_ENV"; echo "exported: $line" ;;
+                *)   echo "::error::build-env line is not KEY=VALUE: $line"; exit 1 ;;
+              esac
+            done <<< "$BUILD_ENV"
+          fi
       - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
       - run: cargo test --workspace ${{ inputs.all-features && '--all-features' || '' }}
 
@@ -426,6 +547,17 @@ jobs:
       matrix:
         member: ${{ fromJSON(needs.msrv-matrix.outputs.members) }}
     steps:
+      - name: Free disk space
+        if: inputs.free-disk-space && runner.os == 'Linux'
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+      - name: Install system packages (macOS)
+        if: inputs.system-packages-macos != '' && runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # `brew install` is already retried internally and bounded by the job
+          # ceiling; `--quiet` keeps the log readable.
+          brew install --quiet ${{ inputs.system-packages-macos }}
       - name: Install system packages
         if: inputs.system-packages != '' && runner.os == 'Linux'
         shell: bash
@@ -452,6 +584,32 @@ jobs:
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
           toolchain: ${{ matrix.member.msrv }}
+      - name: Apply cargo config and build env
+        if: inputs.cargo-config != '' || inputs.build-env != ''
+        shell: bash
+        env:
+          CARGO_CONFIG: ${{ inputs.cargo-config }}
+          BUILD_ENV: ${{ inputs.build-env }}
+        run: |
+          set -euo pipefail
+          # Through env, never inlined: both values are free-form text and GitHub
+          # substitutes expressions into the SCRIPT TEXT, where a quote or a
+          # bracket would reach bash as syntax.
+          if [ -n "${CARGO_CONFIG:-}" ]; then
+            mkdir -p "${CARGO_HOME:-$HOME/.cargo}"
+            printf '%s\n' "$CARGO_CONFIG" >> "${CARGO_HOME:-$HOME/.cargo}/config.toml"
+            echo "appended to ${CARGO_HOME:-$HOME/.cargo}/config.toml:"
+            printf '%s\n' "$CARGO_CONFIG"
+          fi
+          if [ -n "${BUILD_ENV:-}" ]; then
+            while IFS= read -r line; do
+              [ -z "$line" ] && continue
+              case "$line" in
+                *=*) printf '%s\n' "$line" >> "$GITHUB_ENV"; echo "exported: $line" ;;
+                *)   echo "::error::build-env line is not KEY=VALUE: $line"; exit 1 ;;
+              esac
+            done <<< "$BUILD_ENV"
+          fi
       - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
       # The explicit `+<version>` beats rust-toolchain.toml's pin, which is the
       # DEV toolchain rather than the floor. Without it this job silently
@@ -464,14 +622,26 @@ jobs:
           MSRV: ${{ matrix.member.msrv }}
           CHECK: ${{ inputs.msrv-check }}
           ALLF: ${{ inputs.all-features }}
+          MSRV_ARGS: ${{ inputs.msrv-args }}
         run: |
           set -euo pipefail
           scope=(--workspace)
           if [ -n "${MEMBER:-}" ]; then scope=(-p "$MEMBER"); fi
+          # msrv-args carrying its own feature selection REPLACES the automatic
+          # --all-features rather than joining it. A lib+CLI hybrid verifying its
+          # floor with --no-default-features would otherwise get both flags and
+          # cargo would reject the pair -- reading as a broken MSRV rather than a
+          # broken invocation.
+          extra=()
+          if [ -n "${MSRV_ARGS:-}" ]; then read -r -a extra <<< "$MSRV_ARGS"; fi
           feats=()
-          if [ "$ALLF" = "true" ]; then feats=(--all-features); fi
+          case " ${MSRV_ARGS:-} " in
+            *" --no-default-features "*|*" --features "*|*" --all-features "*) ;;
+            *) [ "$ALLF" = "true" ] && feats=(--all-features) || true ;;
+          esac
           echo "verifying ${MEMBER:-<workspace>} at its declared floor $MSRV"
-          cargo "+$MSRV" "$CHECK" "${scope[@]}" "${feats[@]}"
+          set -x
+          cargo "+$MSRV" "$CHECK" "${scope[@]}" "${feats[@]}" "${extra[@]}"
 
   deny:
     timeout-minutes: 20
@@ -646,6 +816,17 @@ jobs:
     env:
       RUSTFLAGS: ""
     steps:
+      - name: Free disk space
+        if: inputs.free-disk-space && runner.os == 'Linux'
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+      - name: Install system packages (macOS)
+        if: inputs.system-packages-macos != '' && runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # `brew install` is already retried internally and bounded by the job
+          # ceiling; `--quiet` keeps the log readable.
+          brew install --quiet ${{ inputs.system-packages-macos }}
       - name: Install system packages
         if: inputs.system-packages != '' && runner.os == 'Linux'
         shell: bash
@@ -697,6 +878,32 @@ jobs:
         with:
           toolchain: nightly
           components: rust-src
+      - name: Apply cargo config and build env
+        if: inputs.cargo-config != '' || inputs.build-env != ''
+        shell: bash
+        env:
+          CARGO_CONFIG: ${{ inputs.cargo-config }}
+          BUILD_ENV: ${{ inputs.build-env }}
+        run: |
+          set -euo pipefail
+          # Through env, never inlined: both values are free-form text and GitHub
+          # substitutes expressions into the SCRIPT TEXT, where a quote or a
+          # bracket would reach bash as syntax.
+          if [ -n "${CARGO_CONFIG:-}" ]; then
+            mkdir -p "${CARGO_HOME:-$HOME/.cargo}"
+            printf '%s\n' "$CARGO_CONFIG" >> "${CARGO_HOME:-$HOME/.cargo}/config.toml"
+            echo "appended to ${CARGO_HOME:-$HOME/.cargo}/config.toml:"
+            printf '%s\n' "$CARGO_CONFIG"
+          fi
+          if [ -n "${BUILD_ENV:-}" ]; then
+            while IFS= read -r line; do
+              [ -z "$line" ] && continue
+              case "$line" in
+                *=*) printf '%s\n' "$line" >> "$GITHUB_ENV"; echo "exported: $line" ;;
+                *)   echo "::error::build-env line is not KEY=VALUE: $line"; exit 1 ;;
+              esac
+            done <<< "$BUILD_ENV"
+          fi
       - name: Install cargo-fuzz
         if: steps.detect.outputs.present == 'true'
         # Deliberately not --locked: cargo-fuzz's pinned Cargo.lock holds an old
@@ -721,6 +928,17 @@ jobs:
     if: inputs.rustdoc-check
     runs-on: ubuntu-latest
     steps:
+      - name: Free disk space
+        if: inputs.free-disk-space && runner.os == 'Linux'
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+      - name: Install system packages (macOS)
+        if: inputs.system-packages-macos != '' && runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # `brew install` is already retried internally and bounded by the job
+          # ceiling; `--quiet` keeps the log readable.
+          brew install --quiet ${{ inputs.system-packages-macos }}
       - name: Install system packages
         if: inputs.system-packages != '' && runner.os == 'Linux'
         shell: bash
@@ -747,6 +965,32 @@ jobs:
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
           toolchain: stable
+      - name: Apply cargo config and build env
+        if: inputs.cargo-config != '' || inputs.build-env != ''
+        shell: bash
+        env:
+          CARGO_CONFIG: ${{ inputs.cargo-config }}
+          BUILD_ENV: ${{ inputs.build-env }}
+        run: |
+          set -euo pipefail
+          # Through env, never inlined: both values are free-form text and GitHub
+          # substitutes expressions into the SCRIPT TEXT, where a quote or a
+          # bracket would reach bash as syntax.
+          if [ -n "${CARGO_CONFIG:-}" ]; then
+            mkdir -p "${CARGO_HOME:-$HOME/.cargo}"
+            printf '%s\n' "$CARGO_CONFIG" >> "${CARGO_HOME:-$HOME/.cargo}/config.toml"
+            echo "appended to ${CARGO_HOME:-$HOME/.cargo}/config.toml:"
+            printf '%s\n' "$CARGO_CONFIG"
+          fi
+          if [ -n "${BUILD_ENV:-}" ]; then
+            while IFS= read -r line; do
+              [ -z "$line" ] && continue
+              case "$line" in
+                *=*) printf '%s\n' "$line" >> "$GITHUB_ENV"; echo "exported: $line" ;;
+                *)   echo "::error::build-env line is not KEY=VALUE: $line"; exit 1 ;;
+              esac
+            done <<< "$BUILD_ENV"
+          fi
       - uses: Swatinem/rust-cache@9bdad043e88c75890e36ad3bbc8d27f0090dd609 # v2.7.8
       # `--no-deps` keeps the gate on this workspace's own docs: a broken link in
       # a dependency is not this repo's to fix and would make the gate red for
@@ -768,6 +1012,17 @@ jobs:
     if: inputs.coverage-gate != 'off'
     runs-on: ubuntu-latest
     steps:
+      - name: Free disk space
+        if: inputs.free-disk-space && runner.os == 'Linux'
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+      - name: Install system packages (macOS)
+        if: inputs.system-packages-macos != '' && runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # `brew install` is already retried internally and bounded by the job
+          # ceiling; `--quiet` keeps the log readable.
+          brew install --quiet ${{ inputs.system-packages-macos }}
       - name: Install system packages
         if: inputs.system-packages != '' && runner.os == 'Linux'
         shell: bash
@@ -795,6 +1050,32 @@ jobs:
         with:
           toolchain: stable
           components: llvm-tools-preview
+      - name: Apply cargo config and build env
+        if: inputs.cargo-config != '' || inputs.build-env != ''
+        shell: bash
+        env:
+          CARGO_CONFIG: ${{ inputs.cargo-config }}
+          BUILD_ENV: ${{ inputs.build-env }}
+        run: |
+          set -euo pipefail
+          # Through env, never inlined: both values are free-form text and GitHub
+          # substitutes expressions into the SCRIPT TEXT, where a quote or a
+          # bracket would reach bash as syntax.
+          if [ -n "${CARGO_CONFIG:-}" ]; then
+            mkdir -p "${CARGO_HOME:-$HOME/.cargo}"
+            printf '%s\n' "$CARGO_CONFIG" >> "${CARGO_HOME:-$HOME/.cargo}/config.toml"
+            echo "appended to ${CARGO_HOME:-$HOME/.cargo}/config.toml:"
+            printf '%s\n' "$CARGO_CONFIG"
+          fi
+          if [ -n "${BUILD_ENV:-}" ]; then
+            while IFS= read -r line; do
+              [ -z "$line" ] && continue
+              case "$line" in
+                *=*) printf '%s\n' "$line" >> "$GITHUB_ENV"; echo "exported: $line" ;;
+                *)   echo "::error::build-env line is not KEY=VALUE: $line"; exit 1 ;;
+              esac
+            done <<< "$BUILD_ENV"
+          fi
       - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
       - uses: taiki-e/install-action@59012be0884e296ca2da49b530610e72c49039ad # v2.81.6
         with:
