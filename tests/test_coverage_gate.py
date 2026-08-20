@@ -63,6 +63,13 @@ CASES = [
     # A scope matching nothing must be an error, never a silent pass.
     ("include-regex matching no file is an error",
                                           "two-files.info",      {"COV_METRIC": "functions", "COV_INCLUDE": "no_such_file"}, 1),
+    # A justification is usually several sentences and belongs above the code it
+    # explains, not crammed onto the same line. The block above counts -- but only
+    # an UNBROKEN one, or an old marker would silently cover a new line below it.
+    ("marker in the comment block directly above exempts",
+                                          "marker-block.info",    {},                                                    0),
+    ("marker separated from the line by code does NOT exempt",
+                                          "marker-detached.info", {},                                                    1),
     # Malformed configuration fails loudly rather than degrading to a pass.
     ("invalid include-regex fails loudly", "two-files.info",     {"COV_INCLUDE": "("},                                  1),
     ("invalid metric fails loudly",        "two-files.info",     {"COV_METRIC": "branches"},                            1),
