@@ -1284,12 +1284,79 @@ jobs:
                   return None
               return lines[n - 1] if 0 < n <= len(lines) else None
 
+          COMMENT_ONLY = re.compile(r"^\s*//")
+
+          # Zero-hit lines per file, filled by a first pass over the lcov. A marker
+          # may sit anywhere above an uncovered line within the SAME DEAD REGION,
+          # so resolving one requires knowing which neighbouring lines are also
+          # dead -- which means reading the whole report before judging any line.
+          dead_lines = {}
+
+          def marker_for(path, n):
+              """The marker on line `n`, or in the comment block directly above it.
+
+              A justification worth reading is usually longer than fits after the
+              code: the fleet writes these as several sentences naming the
+              dominating invariant. Requiring the marker ON the uncovered line
+              forces that reasoning onto one cramped line, or splits it from the
+              thing it explains. An unbroken run of `//` lines immediately above
+              therefore counts as the same annotation.
+
+              The walk upward crosses comment lines and OTHER DEAD LINES, and
+              stops at the first live line. That makes one annotation cover one
+              contiguous dead region, which is what a multi-line arm needs:
+
+                  // cov:unreachable: <why this arm cannot run>
+                  None => Err(ChronoError::OutOfRange {
+                      what: "...",     <- also dead, also covered by that marker
+                      value: 0,
+                  }),
+
+              Requiring a marker per line would put four copies of the same
+              sentence inside one expression.
+
+              It stops at the first LIVE line for the reason that matters: a
+              marker on the far side of executable code annotates something
+              else, and crossing it would let one old justification silently
+              cover a new uncovered line beneath it.
+              """
+              src = source_line(path, n)
+              if src is None:
+                  return None, None
+              m = MARKER.search(src)
+              if m:
+                  return m, src
+              dead = dead_lines.get(path, frozenset())
+              for k in range(n - 1, 0, -1):
+                  above = source_line(path, k)
+                  if above is None:
+                      break
+                  m = MARKER.search(above)
+                  if m:
+                      return m, above
+                  if COMMENT_ONLY.match(above) or k in dead or not above.strip():
+                      continue
+                  break
+              return None, src
+
           uncovered, exempt_annotated, exempt_delim, bare_markers, unreadable = [], [], [], [], []
           uncovered_fns, exempt_fns = [], []
+          fn_hits, fn_line_by_key = {}, {}
           gated_files, skipped_files = set(), set()
           current = None
           gated = False
           fn_line = {}
+
+          with open(lcov_path, encoding="utf-8", errors="replace") as fh:
+              _cur = None
+              for raw in fh:
+                  raw = raw.rstrip("\n")
+                  if raw.startswith("SF:"):
+                      _cur = raw[3:]
+                  elif _cur is not None:
+                      _m = re.match(r"^DA:(\d+),0$", raw)
+                      if _m:
+                          dead_lines.setdefault(_cur, set()).add(int(_m.group(1)))
 
           with open(lcov_path, encoding="utf-8", errors="replace") as fh:
               for raw in fh:
@@ -1306,19 +1373,36 @@ jobs:
                   m = re.match(r"^FN:(\d+),(.+)$", raw)
                   if m:
                       fn_line[m.group(2)] = int(m.group(1))
+                      fn_line_by_key[(current, re.sub(r"Cs[0-9A-Za-z]+_", "Cs_", m.group(2)))] = int(m.group(1))
                       continue
 
-                  m = re.match(r"^FNDA:0,(.+)$", raw)
+                  m = re.match(r"^FNDA:(\d+),(.+)$", raw)
                   if m and gate_functions:
-                      name = m.group(1)
-                      n = fn_line.get(name)
-                      if n is None:
-                          # A hit record with no matching FN declaration: we cannot point at
-                          # a source line, so we cannot let it pass unexamined either.
-                          uncovered_fns.append((current, 0, name))
-                          continue
-                      src = source_line(current, n)
-                      if src is not None and MARKER.search(src):
+                      hits, name = int(m.group(1)), m.group(2)
+                      # Aggregate by symbol with the CRATE DISAMBIGUATOR stripped.
+                      #
+                      # llvm-cov emits one record per instantiation, and two of them mean
+                      # different things -- only one is a finding:
+                      #
+                      #   A generic monomorphized for another type is a real instantiation
+                      #   nobody exercised, which is exactly what this metric exists to
+                      #   catch. Those symbols differ by type parameters, so they remain
+                      #   separate keys here and still fail.
+                      #
+                      #   The same crate compiled twice -- once as a dependency, once
+                      #   standalone for its own tests -- yields identical symbols
+                      #   differing only by the `Cs<hash>_` disambiguator, one copy used
+                      #   and its twin never. Reporting that is a phantom: the function IS
+                      #   exercised, just not in both copies. Observed on timeglyph-core,
+                      #   where every public function appeared twice, half of them at zero.
+                      key = (current, re.sub(r"Cs[0-9A-Za-z]+_", "Cs_", name))
+                      rec = fn_hits.setdefault(key, {"hits": 0, "name": name})
+                      rec["hits"] += hits
+                      if hits:
+                          rec["name"] = name
+                      continue
+                      marker, _ = marker_for(current, n)
+                      if marker:
                           exempt_fns.append((current, n, name))
                       else:
                           uncovered_fns.append((current, n, name))
@@ -1333,8 +1417,9 @@ jobs:
                       # Fail loud: a zero-hit line we cannot read is not a pass.
                       unreadable.append((current, n))
                       continue
-                  marker = MARKER.search(src)
+                  marker, marker_src = marker_for(current, n)
                   if marker:
+                      src = marker_src
                       if marker.group("reason"):
                           exempt_annotated.append((current, n, src.strip()))
                       elif require_reason:
@@ -1345,6 +1430,21 @@ jobs:
                       exempt_delim.append((current, n, src.strip()))
                   else:
                       uncovered.append((current, n, src.strip()))
+
+          # Resolve the aggregated function records: a function counts as
+          # uncovered only when EVERY instantiation of it went unentered.
+          for (path, _key), rec in sorted(fn_hits.items()):
+              if rec["hits"]:
+                  continue
+              n = fn_line_by_key.get((path, _key)) or fn_line.get(rec["name"])
+              if n is None:
+                  uncovered_fns.append((path, 0, rec["name"]))
+                  continue
+              marker, _ = marker_for(path, n)
+              if marker:
+                  exempt_fns.append((path, n, rec["name"]))
+              else:
+                  uncovered_fns.append((path, n, rec["name"]))
 
           # A scope that matches nothing is a gate running over zero files. That reports
           # green while verifying nothing, so it is an error rather than a pass.
